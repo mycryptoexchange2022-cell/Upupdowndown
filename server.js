@@ -2,49 +2,52 @@
 //  BTC LADDER BOT — All-in-one server
 //  Polymarket 15-min BTC Up/Down Windows
 //  Logic: Previous window winner determines active ladder
-//  No stop loss. Entry 0.40-0.65, buy 100 every -0.05,
+//  Entry 0.05-0.90, buy 100 every -0.05,
 //  sell all at avg+0.10, re-entry at lastSell-0.05
 //
-//  FIXES:
-//  1. Entry range changed: ENTRY_MIN=0.40, ENTRY_MAX=0.65
-//  2. Token ID extraction: handles clobTokenIds + tokens[] + tokenIds[]
-//  3. WebSocket: heartbeat ping every 20s, exponential backoff reconnect,
-//     wsAlive flag prevents duplicate reconnect loops, REST fallback
-//     continues independently so prices never go stale on WS drop
-//  4. Sim prices: UP+DOWN always sum to 1.00 (complementary)
-//  5. REST fallback getPrices uses best_bid/best_ask fields too
-//  6. endWindow: cleans up WS alive flag so reconnect loop stops cleanly
-//  7. Dashboard WS: heartbeat ping to detect stale browser connections
+//  FIXES v3:
+//  1. clobTokenIds is a JSON STRING — must JSON.parse() it
+//  2. Market discovery uses EVENTS endpoint (/events?slug=) as primary,
+//     falls back to /markets?slug= and broad tag search
+//  3. WS code 1006 loop fixed: empty assetIds caused immediate rejection
+//     by Polymarket → WS now skips subscribe if no IDs, falls to REST poll
+//  4. WS subscription payload fixed: { type:'Market', assets_ids:[...] }
+//     (Polymarket CLOB WS expects assets_ids not markets)
+//  5. REST poll runs independently as a safety net at all times
+//  6. Entry range: ENTRY_MIN=0.05, ENTRY_MAX=0.90 (restored per user)
+//  7. Sim prices: UP+DOWN always complement to 1.00
+//  8. Exponential WS backoff, heartbeat ping/pong, wsAlive cleanup
+//  9. Dashboard WS heartbeat to detect dead browser connections
 // ============================================================
 
 'use strict';
 
-const express   = require('express');
-const http      = require('http');
-const WebSocket = require('ws');
-const path      = require('path');
-const cors      = require('cors');
-const fetch     = require('node-fetch');
+const express    = require('express');
+const http       = require('http');
+const WebSocket  = require('ws');
+const path       = require('path');
+const cors       = require('cors');
+const fetch      = require('node-fetch');
 
 // ============================================================
 //  CONSTANTS
 // ============================================================
 const DEMO_CAPITAL   = 2000;
-const ENTRY_MIN      = 0.40;   // ← changed from 0.05
-const ENTRY_MAX      = 0.65;   // ← changed from 0.90
+const ENTRY_MIN      = 0.05;
+const ENTRY_MAX      = 0.90;
 const BUY_STEP       = 0.05;
 const SELL_PROFIT    = 0.10;
 const REENTRY_STEP   = 0.05;
 const SHARES_PER_BUY = 100;
 
-const WS_PING_INTERVAL  = 20_000;   // heartbeat every 20s
-const WS_PONG_TIMEOUT   = 10_000;   // declare dead if no pong in 10s
-const REST_POLL_MS      = 4_000;    // REST fallback poll interval
-const WS_RECONNECT_BASE = 2_000;    // base reconnect delay (ms)
-const WS_RECONNECT_MAX  = 30_000;   // max reconnect delay (ms)
+const WS_PING_MS        = 20_000;
+const REST_POLL_MS      = 4_000;
+const WS_RECONNECT_BASE = 3_000;
+const WS_RECONNECT_MAX  = 30_000;
 
 const POLY_API = 'https://gamma-api.polymarket.com';
 const CLOB_API = 'https://clob.polymarket.com';
+// Polymarket CLOB WebSocket — correct subscription endpoint
 const POLY_WS  = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
 // ============================================================
@@ -58,7 +61,6 @@ let S = {
   wins:            0,
   losses:          0,
   lastResolution:  null,
-
   currentWindow:   null,
   nextWindow:      null,
   upLadder:        null,
@@ -67,7 +69,6 @@ let S = {
   downPrice:       null,
   upTokenId:       null,
   downTokenId:     null,
-
   windowStatus:    'searching',
   windowHistory:   [],
   tradeLog:        [],
@@ -80,14 +81,13 @@ let S = {
   activeLadders:   'both',
 };
 
-// WS handle + timers (module-level so they can be cleaned up)
-let polyWs          = null;
-let wsAlive         = false;   // controls the reconnect loop
-let wsPingTimer     = null;
-let priceTimer      = null;
-let simTimer        = null;
-let dashClients     = new Set();
-let simPrice        = { up: 0.55, down: 0.45 };
+let polyWs       = null;
+let wsAlive      = false;
+let wsPingTimer  = null;
+let priceTimer   = null;
+let simTimer     = null;
+let dashClients  = new Set();
+let simPrice     = { up: 0.55, down: 0.45 };
 
 // ============================================================
 //  LADDER HELPERS
@@ -95,17 +95,14 @@ let simPrice        = { up: 0.55, down: 0.45 };
 function makeLadder(side) {
   return { side, positions: [], lastSoldPrice: null, totalShares: 0, totalCost: 0 };
 }
-
 function ladderAvg(l) {
   return l.totalShares === 0 ? 0 : l.totalCost / l.totalShares;
 }
-
 function ladderNextBuy(l) {
   if (l.positions.length === 0) return null;
   const lowest = Math.min(...l.positions.map(p => p.price));
   return parseFloat((lowest - BUY_STEP).toFixed(4));
 }
-
 function ladderReEntry(l) {
   if (l.lastSoldPrice === null) return ENTRY_MAX;
   return parseFloat((l.lastSoldPrice - REENTRY_STEP).toFixed(4));
@@ -139,12 +136,9 @@ function tickLadder(ladder, price, capital) {
     }
   }
 
-  // BUY: first entry or ladder step-down
+  // BUY
   const reEntry = ladderReEntry(ladder);
-
   if (ladder.positions.length === 0) {
-    // First buy: price must be within entry band
-    // If we sold before, re-enter only at lastSell - REENTRY_STEP or lower
     const threshold = ladder.lastSoldPrice !== null ? reEntry : ENTRY_MAX;
     if (price >= ENTRY_MIN && price <= threshold && capital >= price * SHARES_PER_BUY) {
       const cost = price * SHARES_PER_BUY;
@@ -159,7 +153,6 @@ function tickLadder(ladder, price, capital) {
       });
     }
   } else {
-    // Add to ladder: price dropped BUY_STEP below lowest position
     const nextBuy = ladderNextBuy(ladder);
     if (nextBuy !== null && price <= nextBuy && price >= ENTRY_MIN && capital >= price * SHARES_PER_BUY) {
       const cost = price * SHARES_PER_BUY;
@@ -174,7 +167,6 @@ function tickLadder(ladder, price, capital) {
       });
     }
   }
-
   return { actions, capital };
 }
 
@@ -204,7 +196,7 @@ function settleWindow(resolution) {
 }
 
 // ============================================================
-//  WHICH LADDERS ARE ACTIVE THIS WINDOW?
+//  ACTIVE LADDERS
 // ============================================================
 function setActiveLadders() {
   if (!S.lastResolution) {
@@ -212,10 +204,10 @@ function setActiveLadders() {
     log('📊 No prior window — both ladders active', 'info');
   } else if (S.lastResolution === 'up') {
     S.activeLadders = 'up';
-    log('📈 Prev window UP — only UP ladder active this window', 'info');
+    log('📈 Prev window UP — only UP ladder active', 'info');
   } else {
     S.activeLadders = 'down';
-    log('📉 Prev window DOWN — only DOWN ladder active this window', 'info');
+    log('📉 Prev window DOWN — only DOWN ladder active', 'info');
   }
 }
 
@@ -224,13 +216,11 @@ function setActiveLadders() {
 // ============================================================
 function processTick() {
   if (S.windowStatus !== 'active') return;
-
   if ((S.activeLadders === 'both' || S.activeLadders === 'up') && S.upLadder && S.upPrice !== null) {
     const { actions, capital } = tickLadder(S.upLadder, S.upPrice, S.capital);
     S.capital = capital;
     actions.forEach(a => log(a.msg, a.type === 'BUY' ? 'buy' : 'sell'));
   }
-
   if ((S.activeLadders === 'both' || S.activeLadders === 'down') && S.downLadder && S.downPrice !== null) {
     const { actions, capital } = tickLadder(S.downLadder, S.downPrice, S.capital);
     S.capital = capital;
@@ -239,136 +229,179 @@ function processTick() {
 }
 
 // ============================================================
-//  POLYMARKET API — findWindows
-//  Handles tokens[], clobTokenIds[], and tokenIds[] response shapes
+//  TOKEN ID EXTRACTION
+//  KEY FIX: clobTokenIds is a JSON *string* — must JSON.parse()
+//  e.g.  m.clobTokenIds = '["123456...","789012..."]'
+//  Also handles tokens[] array and outcomes[] pairing
 // ============================================================
 function extractTokenIds(m) {
-  // Shape 1: tokens array with outcome labels
-  const tokens = m.tokens || [];
   let upId = null, downId = null;
 
-  for (const t of tokens) {
-    const o = (t.outcome || '').toLowerCase();
-    const id = t.token_id || t.tokenId || t.id || null;
-    if (o.includes('up'))   upId   = id;
-    if (o.includes('down')) downId = id;
-  }
-
-  // Shape 2: clobTokenIds paired with outcomes array
-  if ((!upId || !downId) && m.clobTokenIds && m.clobTokenIds.length >= 2) {
-    let outcomes = [];
-    try { outcomes = JSON.parse(m.outcomes || '[]'); } catch {}
-    for (let i = 0; i < m.clobTokenIds.length; i++) {
-      const o = (outcomes[i] || '').toLowerCase();
-      if (o.includes('up'))   upId   = upId   || m.clobTokenIds[i];
-      if (o.includes('down')) downId = downId || m.clobTokenIds[i];
+  // ── Shape 1: clobTokenIds is a JSON string (most common for 15m markets) ──
+  if (m.clobTokenIds) {
+    let ids = [];
+    if (typeof m.clobTokenIds === 'string') {
+      try { ids = JSON.parse(m.clobTokenIds); } catch {}
+    } else if (Array.isArray(m.clobTokenIds)) {
+      ids = m.clobTokenIds;
     }
-    // If still not matched by label, use index order (index 0=up, 1=down)
-    if (!upId)   upId   = m.clobTokenIds[0];
-    if (!downId) downId = m.clobTokenIds[1];
+
+    if (ids.length >= 2) {
+      // Try to pair with outcomes array
+      let outcomes = [];
+      if (typeof m.outcomes === 'string') {
+        try { outcomes = JSON.parse(m.outcomes); } catch {}
+      } else if (Array.isArray(m.outcomes)) {
+        outcomes = m.outcomes;
+      }
+
+      for (let i = 0; i < ids.length; i++) {
+        const o = (outcomes[i] || '').toLowerCase();
+        if (o.includes('up'))   { upId   = ids[i]; continue; }
+        if (o.includes('down')) { downId = ids[i]; continue; }
+      }
+      // If outcomes didn't match labels, fall back to index 0=up, 1=down
+      if (!upId)   upId   = ids[0];
+      if (!downId) downId = ids[1];
+    }
   }
 
-  // Shape 3: tokenIds flat array
-  if ((!upId || !downId) && m.tokenIds && m.tokenIds.length >= 2) {
-    upId   = upId   || m.tokenIds[0];
-    downId = downId || m.tokenIds[1];
+  // ── Shape 2: tokens[] array with outcome labels ──
+  if ((!upId || !downId) && Array.isArray(m.tokens) && m.tokens.length >= 2) {
+    for (const t of m.tokens) {
+      const o  = (t.outcome || '').toLowerCase();
+      const id = t.token_id || t.tokenId || t.id || null;
+      if (o.includes('up')   && !upId)   upId   = id;
+      if (o.includes('down') && !downId) downId = id;
+    }
+    if (!upId)   upId   = m.tokens[0]?.token_id || m.tokens[0]?.id;
+    if (!downId) downId = m.tokens[1]?.token_id || m.tokens[1]?.id;
   }
 
-  // Shape 4: fall back to position in tokens array
-  if (!upId   && tokens[0]) upId   = tokens[0].token_id || tokens[0].id;
-  if (!downId && tokens[1]) downId = tokens[1].token_id || tokens[1].id;
+  return { upId: upId || null, downId: downId || null };
+}
 
-  return { upId: upId || null, downId: downId || null, rawTokens: tokens };
+// ============================================================
+//  MARKET DISCOVERY
+//  Three strategies tried in order:
+//  1. Gamma /events?slug= (Polymarket event slug — what the URL shows)
+//  2. Gamma /markets?slug= (market-level slug, same format)
+//  3. Broad tag search fallback
+// ============================================================
+async function fetchMarketBySlug(slug) {
+  // Strategy 1: events endpoint (Polymarket URLs are /event/<slug>)
+  try {
+    const r = await fetch(`${POLY_API}/events?slug=${slug}`, { timeout: 7000 });
+    if (r.ok) {
+      const data = await r.json();
+      const event = Array.isArray(data) ? data[0] : data;
+      if (event && Array.isArray(event.markets) && event.markets.length > 0) {
+        // An event contains multiple markets; we want the one with UP/DOWN outcomes
+        const m = event.markets.find(mk =>
+          mk.question && (mk.question.toLowerCase().includes('up') || mk.question.toLowerCase().includes('higher'))
+        ) || event.markets[0];
+        // Merge event-level fields so extractTokenIds sees everything
+        const merged = { ...m, clobTokenIds: m.clobTokenIds || event.clobTokenIds };
+        return { found: true, market: merged, eventId: event.id };
+      }
+    }
+  } catch {}
+
+  // Strategy 2: markets endpoint with slug param
+  try {
+    const r = await fetch(`${POLY_API}/markets?slug=${slug}`, { timeout: 7000 });
+    if (r.ok) {
+      const data = await r.json();
+      if (Array.isArray(data) && data.length > 0) {
+        return { found: true, market: data[0], eventId: null };
+      }
+    }
+  } catch {}
+
+  return { found: false };
 }
 
 async function findWindows() {
-  try {
-    const now    = Math.floor(Date.now() / 1000);
-    const base   = Math.floor(now / 900) * 900;
-    const results = [];
+  const now    = Math.floor(Date.now() / 1000);
+  const base   = Math.floor(now / 900) * 900;
+  const results = [];
 
-    // Try the next 4 possible 15-min slots
-    for (let i = 0; i <= 3; i++) {
-      const endsAt = base + i * 900 + 900;
-      const slug   = `btc-updown-15m-${endsAt}`;
-      try {
-        const r = await fetch(`${POLY_API}/markets?slug=${slug}`, { timeout: 6000 });
-        if (r.ok) {
-          const data = await r.json();
-          if (data && data.length > 0) {
-            const m = data[0];
-            const { upId, downId, rawTokens } = extractTokenIds(m);
-            results.push({
-              slug, marketId: m.id, endsAt, ts: endsAt - 900,
-              tokens: rawTokens, upTokenId: upId, downTokenId: downId,
-              active: m.active, closed: m.closed,
-            });
-          }
-        }
-      } catch {}
-    }
-
-    // Broad search fallback
-    if (results.length === 0) {
-      try {
-        const r = await fetch(`${POLY_API}/markets?tag=BTC&limit=50&active=true`, { timeout: 8000 });
-        if (r.ok) {
-          const data = await r.json();
-          (data || [])
-            .filter(m => m.slug && m.slug.includes('btc-updown-15m'))
-            .forEach(m => {
-              const match = m.slug.match(/btc-updown-15m-(\d+)/);
-              if (match) {
-                const endsAt = parseInt(match[1]);
-                const { upId, downId, rawTokens } = extractTokenIds(m);
-                results.push({
-                  slug: m.slug, marketId: m.id, endsAt, ts: endsAt - 900,
-                  tokens: rawTokens, upTokenId: upId, downTokenId: downId,
-                  active: m.active, closed: m.closed,
-                });
-              }
-            });
-        }
-      } catch {}
-    }
-
-    return results;
-  } catch (e) {
-    return [];
+  // Try the next 4 possible 15-min windows
+  for (let i = 0; i <= 3; i++) {
+    const endsAt = base + i * 900 + 900;
+    const slug   = `btc-updown-15m-${endsAt}`;
+    try {
+      const { found, market } = await fetchMarketBySlug(slug);
+      if (found && market) {
+        const { upId, downId } = extractTokenIds(market);
+        results.push({
+          slug,
+          marketId:    market.id,
+          conditionId: market.conditionId || null,
+          endsAt,
+          ts:          endsAt - 900,
+          upTokenId:   upId,
+          downTokenId: downId,
+          active:      market.active,
+          closed:      market.closed,
+          bestBid:     market.bestBid   || null,
+          bestAsk:     market.bestAsk   || null,
+        });
+      }
+    } catch {}
   }
+
+  // Broad fallback: search active BTC markets
+  if (results.length === 0) {
+    try {
+      const r = await fetch(`${POLY_API}/markets?tag=BTC&limit=50&active=true&closed=false`, { timeout: 10000 });
+      if (r.ok) {
+        const data = await r.json();
+        (data || [])
+          .filter(m => m.slug && m.slug.includes('btc-updown-15m'))
+          .forEach(m => {
+            const match = m.slug.match(/btc-updown-15m-(\d+)/);
+            if (!match) return;
+            const endsAt = parseInt(match[1]);
+            const { upId, downId } = extractTokenIds(m);
+            results.push({
+              slug: m.slug, marketId: m.id, conditionId: m.conditionId || null,
+              endsAt, ts: endsAt - 900,
+              upTokenId: upId, downTokenId: downId,
+              active: m.active, closed: m.closed,
+              bestBid: m.bestBid || null, bestAsk: m.bestAsk || null,
+            });
+          });
+      }
+    } catch {}
+  }
+
+  return results;
 }
 
 // ============================================================
-//  POLYMARKET API — getPrices (REST fallback)
-//  Handles bids/asks arrays AND best_bid/best_ask flat fields
+//  PRICES — REST
+//  Uses CLOB /book endpoint; also seeds from bestBid/bestAsk
+//  on the market object as an instant fallback
 // ============================================================
 async function getPrices(upId, downId) {
   const out = { up: null, down: null };
   for (const [id, key] of [[upId, 'up'], [downId, 'down']]) {
     if (!id) continue;
     try {
-      const r = await fetch(`${CLOB_API}/book?token_id=${id}`, { timeout: 4000 });
+      const r = await fetch(`${CLOB_API}/book?token_id=${id}`, { timeout: 5000 });
       if (r.ok) {
         const d    = await r.json();
         const bids = d.bids || [];
         const asks = d.asks || [];
-
-        // Best bid/ask from arrays
         let bid = bids.length ? parseFloat(bids[0].price) : 0;
         let ask = asks.length ? parseFloat(asks[0].price) : 0;
-
-        // Flat fields fallback (some CLOB responses use these)
+        // Flat field fallback
         if (!bid && d.best_bid) bid = parseFloat(d.best_bid);
         if (!ask && d.best_ask) ask = parseFloat(d.best_ask);
-
-        if (bid > 0 && ask > 0) {
-          out[key] = parseFloat(((bid + ask) / 2).toFixed(4));
-        } else if (bid > 0) {
-          out[key] = bid;
-        } else if (ask > 0) {
-          out[key] = ask;
-        }
-        // If nothing, leave null — do not fall back to 0.5 (hides real stale state)
+        if (bid > 0 && ask > 0) out[key] = parseFloat(((bid + ask) / 2).toFixed(4));
+        else if (bid > 0)       out[key] = bid;
+        else if (ask > 0)       out[key] = ask;
       }
     } catch {}
   }
@@ -376,7 +409,148 @@ async function getPrices(upId, downId) {
 }
 
 // ============================================================
-//  POLYMARKET API — checkResolution
+//  PRICES — WebSocket
+//  FIX: subscription payload must use `assets_ids` (not `markets`)
+//  FIX: skip WS entirely if no token IDs — avoids code 1006 loop
+// ============================================================
+function stopWS() {
+  wsAlive = false;
+  if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
+  if (polyWs) { try { polyWs.terminate(); } catch {} polyWs = null; }
+  S.wsConnected = false;
+}
+
+function stopRESTPoll() {
+  if (priceTimer) { clearInterval(priceTimer); priceTimer = null; }
+}
+
+function startRESTPoll() {
+  stopRESTPoll();
+  priceTimer = setInterval(async () => {
+    if (S.windowStatus !== 'active') return;
+    try {
+      const p = await getPrices(S.upTokenId, S.downTokenId);
+      let updated = false;
+      if (p.up   !== null) { S.upPrice   = p.up;   pushHistory('up',   p.up);   updated = true; }
+      if (p.down !== null) { S.downPrice = p.down; pushHistory('down', p.down); updated = true; }
+      if (updated) {
+        S.lastPriceUpdate = Date.now();
+        processTick();
+        broadcastState();
+      }
+    } catch {}
+  }, REST_POLL_MS);
+}
+
+function subscribeWS(assetIds) {
+  // If no real token IDs, skip WS — use REST poll + simulation prices
+  if (!assetIds || assetIds.length === 0) {
+    log('⚠️  No token IDs — REST poll + simulation prices active', 'warn');
+    startSimPrices();
+    return;
+  }
+
+  wsAlive = true;
+  let attempt = 0;
+
+  // REST poll runs independently as fallback at all times
+  startRESTPoll();
+
+  function connect() {
+    if (!wsAlive) return;
+
+    const backoff = Math.min(WS_RECONNECT_BASE * Math.pow(1.5, attempt), WS_RECONNECT_MAX);
+    attempt++;
+
+    try {
+      const ws = new WebSocket(POLY_WS);
+      let pongOk = true;
+
+      if (wsPingTimer) clearInterval(wsPingTimer);
+      wsPingTimer = setInterval(() => {
+        if (!pongOk) {
+          log('💔 WS ping timeout — reconnecting', 'warn');
+          S.wsConnected = false;
+          clearInterval(wsPingTimer);
+          wsPingTimer = null;
+          try { ws.terminate(); } catch {}
+          if (wsAlive) setTimeout(connect, backoff);
+          return;
+        }
+        pongOk = false;
+        try { ws.ping(); } catch {}
+      }, WS_PING_MS);
+
+      ws.on('pong', () => { pongOk = true; });
+
+      ws.on('open', () => {
+        attempt = 0;
+        S.wsConnected  = true;
+        S.wsReconnects += attempt > 0 ? 1 : 0;
+
+        // ── CRITICAL FIX: Polymarket CLOB WS uses assets_ids not markets ──
+        ws.send(JSON.stringify({
+          auth:       {},
+          type:       'Market',
+          assets_ids: assetIds,     // ← correct field name
+        }));
+
+        log(`🔌 WS connected | tokens: ${assetIds.join(', ').substring(0, 60)}...`, 'success');
+        broadcastState();
+      });
+
+      ws.on('message', raw => {
+        try {
+          const msgs = JSON.parse(raw.toString());
+          const arr  = Array.isArray(msgs) ? msgs : [msgs];
+          let updated = false;
+
+          for (const m of arr) {
+            // Price can be in: price, best_ask, last_trade_price, mid
+            let price = parseFloat(
+              m.price || m.best_ask || m.last_trade_price || m.mid || 0
+            );
+            if (!price || isNaN(price) || price <= 0) continue;
+
+            if (m.asset_id === S.upTokenId) {
+              S.upPrice = price; pushHistory('up', price); updated = true;
+            }
+            if (m.asset_id === S.downTokenId) {
+              S.downPrice = price; pushHistory('down', price); updated = true;
+            }
+          }
+
+          if (updated) {
+            S.lastPriceUpdate = Date.now();
+            processTick();
+            broadcastState();
+          }
+        } catch {}
+      });
+
+      ws.on('close', (code) => {
+        S.wsConnected = false;
+        if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
+        if (wsAlive) {
+          log(`🔄 WS closed (${code}) — reconnect in ${Math.round(backoff / 1000)}s`, 'warn');
+          broadcastState();
+          setTimeout(connect, backoff);
+        }
+      });
+
+      ws.on('error', () => { S.wsConnected = false; });
+
+      polyWs = ws;
+    } catch {
+      if (wsAlive) setTimeout(connect, backoff);
+    }
+  }
+
+  connect();
+}
+
+// ============================================================
+//  RESOLUTION CHECK
 // ============================================================
 async function checkResolution(marketId) {
   try {
@@ -384,15 +558,14 @@ async function checkResolution(marketId) {
     if (r.ok) {
       const d = await r.json();
       if (d.closed || d.resolved) {
-        // Shape 1: tokens with winner flag
-        const winner = (d.tokens || []).find(t => t.winner);
+        const tokens = Array.isArray(d.tokens) ? d.tokens : [];
+        const winner = tokens.find(t => t.winner);
         if (winner) {
           return {
             resolved: true,
             winner: (winner.outcome || '').toLowerCase().includes('up') ? 'up' : 'down',
           };
         }
-        // Shape 2: outcomePrices + outcomes arrays
         if (d.outcomePrices) {
           try {
             const prices   = JSON.parse(d.outcomePrices).map(Number);
@@ -411,163 +584,19 @@ async function checkResolution(marketId) {
 }
 
 // ============================================================
-//  WEBSOCKET PRICE FEED — with heartbeat + exponential backoff
-// ============================================================
-function stopWS() {
-  wsAlive = false;
-  if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
-  if (polyWs) {
-    try { polyWs.terminate(); } catch {}
-    polyWs = null;
-  }
-  S.wsConnected = false;
-}
-
-function stopRESTPoll() {
-  if (priceTimer) { clearInterval(priceTimer); priceTimer = null; }
-}
-
-function startRESTPoll() {
-  stopRESTPoll();
-  priceTimer = setInterval(async () => {
-    if (S.windowStatus !== 'active') return;
-    try {
-      const p = await getPrices(S.upTokenId, S.downTokenId);
-      if (p.up   !== null) { S.upPrice   = p.up;   pushHistory('up',   p.up);   }
-      if (p.down !== null) { S.downPrice = p.down; pushHistory('down', p.down); }
-      S.lastPriceUpdate = Date.now();
-      processTick();
-      broadcastState();
-    } catch {}
-  }, REST_POLL_MS);
-}
-
-function subscribeWS(assetIds) {
-  if (!assetIds.length) {
-    log('⚠️  No asset IDs for WS — using simulation prices', 'warn');
-    startSimPrices();
-    return;
-  }
-
-  wsAlive = true;
-  let attempt = 0;
-
-  // REST poll runs independently as safety net regardless of WS state
-  startRESTPoll();
-
-  function connect() {
-    if (!wsAlive) return;   // window ended — stop reconnecting
-
-    const delay = Math.min(WS_RECONNECT_BASE * Math.pow(1.5, attempt), WS_RECONNECT_MAX);
-    attempt++;
-
-    try {
-      const ws = new WebSocket(POLY_WS);
-      let pongReceived = true;   // treat as alive until first ping
-
-      // ---- heartbeat ping ----
-      if (wsPingTimer) clearInterval(wsPingTimer);
-      wsPingTimer = setInterval(() => {
-        if (!pongReceived) {
-          // No pong — connection is dead, force reconnect
-          log('💔 WS heartbeat timeout — reconnecting...', 'warn');
-          S.wsConnected = false;
-          broadcastState();
-          clearInterval(wsPingTimer);
-          wsPingTimer = null;
-          try { ws.terminate(); } catch {}
-          if (wsAlive) setTimeout(connect, delay);
-          return;
-        }
-        pongReceived = false;
-        try { ws.ping(); } catch {}
-      }, WS_PING_INTERVAL);
-
-      ws.on('pong', () => { pongReceived = true; });
-
-      ws.on('open', () => {
-        attempt = 0;   // reset backoff on successful connect
-        S.wsConnected = true;
-        S.wsReconnects = attempt > 1 ? S.wsReconnects + 1 : S.wsReconnects;
-        ws.send(JSON.stringify({ auth: {}, markets: assetIds, type: 'Market' }));
-        log('🔌 WebSocket connected to Polymarket', 'success');
-        broadcastState();
-      });
-
-      ws.on('message', raw => {
-        try {
-          const msgs = JSON.parse(raw.toString());
-          const arr  = Array.isArray(msgs) ? msgs : [msgs];
-          let updated = false;
-
-          for (const m of arr) {
-            // Accept: price, best_ask, last_trade_price
-            let price = parseFloat(m.price || m.best_ask || m.last_trade_price || 0);
-            if (!price || isNaN(price)) continue;
-
-            if (m.asset_id === S.upTokenId) {
-              S.upPrice = price;
-              pushHistory('up', price);
-              updated = true;
-            }
-            if (m.asset_id === S.downTokenId) {
-              S.downPrice = price;
-              pushHistory('down', price);
-              updated = true;
-            }
-          }
-
-          if (updated) {
-            S.lastPriceUpdate = Date.now();
-            processTick();
-            broadcastState();
-          }
-        } catch {}
-      });
-
-      ws.on('close', (code, reason) => {
-        S.wsConnected = false;
-        if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
-        if (wsAlive) {
-          log(`🔄 WS closed (${code}) — reconnecting in ${Math.round(delay/1000)}s`, 'warn');
-          broadcastState();
-          setTimeout(connect, delay);
-        }
-      });
-
-      ws.on('error', err => {
-        S.wsConnected = false;
-        // 'close' event fires after 'error', so reconnect is handled there
-      });
-
-      polyWs = ws;
-    } catch (e) {
-      if (wsAlive) setTimeout(connect, delay);
-    }
-  }
-
-  connect();
-}
-
-// ============================================================
-//  SIMULATION MODE — UP + DOWN always sum to 1.00
+//  SIMULATION PRICES — UP+DOWN always sum to 1.00
 // ============================================================
 function startSimPrices() {
-  // Start in a realistic range for a near-50/50 binary market
-  simPrice.up   = parseFloat((0.44 + Math.random() * 0.12).toFixed(4)); // 0.44–0.56
+  simPrice.up   = parseFloat((0.44 + Math.random() * 0.12).toFixed(4));
   simPrice.down = parseFloat((1.0 - simPrice.up).toFixed(4));
-
   if (simTimer) clearInterval(simTimer);
   simTimer = setInterval(() => {
     if (S.windowStatus !== 'active') { clearInterval(simTimer); simTimer = null; return; }
-
-    // Random walk on UP; DOWN is complement so they always sum to 1
-    const delta = (Math.random() - 0.49) * 0.014;
+    const delta  = (Math.random() - 0.49) * 0.014;
     simPrice.up  = Math.max(0.05, Math.min(0.95, simPrice.up + delta));
     simPrice.down = parseFloat((1.0 - simPrice.up).toFixed(4));
-
-    S.upPrice   = parseFloat(simPrice.up.toFixed(4));
-    S.downPrice = parseFloat(simPrice.down.toFixed(4));
+    S.upPrice    = parseFloat(simPrice.up.toFixed(4));
+    S.downPrice  = parseFloat(simPrice.down.toFixed(4));
     pushHistory('up',   S.upPrice);
     pushHistory('down', S.downPrice);
     S.lastPriceUpdate = Date.now();
@@ -594,12 +623,21 @@ async function findAndStart() {
   const now     = Math.floor(Date.now() / 1000);
 
   if (windows.length === 0) {
-    log('⚠️  No live windows found — starting simulation', 'warn');
+    log('⚠️  No windows found — starting simulation', 'warn');
     startSim();
     return;
   }
 
-  const active   = windows.find(w => w.ts <= now && w.endsAt > now && !w.closed);
+  // Prefer windows that have token IDs
+  const active = windows
+    .filter(w => w.ts <= now && w.endsAt > now && !w.closed)
+    .sort((a, b) => {
+      // Prefer ones with both token IDs
+      const aHas = (a.upTokenId && a.downTokenId) ? 1 : 0;
+      const bHas = (b.upTokenId && b.downTokenId) ? 1 : 0;
+      return bHas - aHas;
+    })[0];
+
   const upcoming = windows.find(w => w.ts > now);
 
   if (active) {
@@ -613,7 +651,7 @@ async function findAndStart() {
     broadcastState();
     setTimeout(() => startWindow(upcoming, null), wait * 1000);
   } else {
-    log('⚠️  No suitable windows found — retrying in 30s', 'warn');
+    log('⚠️  No suitable windows — retrying in 30s', 'warn');
     setTimeout(findAndStart, 30_000);
   }
 }
@@ -621,20 +659,26 @@ async function findAndStart() {
 async function startWindow(win, next) {
   log(`🚀 Window started: ${win.slug}`, 'success');
 
-  // Use pre-extracted token IDs from findWindows, or re-extract as fallback
   let upId   = win.upTokenId   || null;
   let downId = win.downTokenId || null;
 
-  if (!upId && !downId) {
-    log('⚠️  Token IDs missing from window data — attempting re-fetch', 'warn');
+  // If token IDs are missing, attempt a re-fetch of just this market
+  if (!upId || !downId) {
+    log('⚠️  Token IDs incomplete — re-fetching market...', 'warn');
     try {
-      const r = await fetch(`${POLY_API}/markets?slug=${win.slug}`, { timeout: 6000 });
-      if (r.ok) {
-        const data = await r.json();
-        if (data && data.length > 0) {
-          const { upId: u, downId: d } = extractTokenIds(data[0]);
-          upId   = u;
-          downId = d;
+      const { found, market } = await fetchMarketBySlug(win.slug);
+      if (found && market) {
+        const ids = extractTokenIds(market);
+        upId   = ids.upId   || upId;
+        downId = ids.downId || downId;
+        // Also seed price from market object if available
+        if (market.bestBid && market.bestAsk) {
+          const mid = parseFloat(((parseFloat(market.bestBid) + parseFloat(market.bestAsk)) / 2).toFixed(4));
+          if (!isNaN(mid) && mid > 0) {
+            S.upPrice   = mid;
+            S.downPrice = parseFloat((1.0 - mid).toFixed(4));
+            log(`💰 Seeded price from market: UP=$${S.upPrice} DOWN=$${S.downPrice}`, 'info');
+          }
         }
       }
     } catch {}
@@ -653,15 +697,20 @@ async function startWindow(win, next) {
   setActiveLadders();
 
   if (upId || downId) {
-    log(`🪙 Tokens — UP: ${upId || 'n/a'} | DOWN: ${downId || 'n/a'}`, 'info');
-    // Seed prices via REST before WS connects
+    log(`🪙 UP token:   ${upId   || 'n/a'}`, 'info');
+    log(`🪙 DOWN token: ${downId || 'n/a'}`, 'info');
+    // Seed initial price via REST before WS connects
     const p = await getPrices(upId, downId);
     if (p.up   !== null) { S.upPrice   = p.up;   pushHistory('up',   p.up);   }
     if (p.down !== null) { S.downPrice = p.down; pushHistory('down', p.down); }
+    if (p.up !== null || p.down !== null) {
+      log(`📈 Initial prices — UP: $${S.upPrice} | DOWN: $${S.downPrice}`, 'info');
+    }
     subscribeWS([upId, downId].filter(Boolean));
   } else {
-    log('⚠️  No token IDs resolved — using simulation prices', 'warn');
+    log('⚠️  No token IDs found — simulation mode', 'warn');
     startSimPrices();
+    startRESTPoll(); // still try REST in case IDs appear later
   }
 
   const timeLeft = Math.max(0, win.endsAt - Math.floor(Date.now() / 1000));
@@ -675,12 +724,10 @@ async function endWindow(win) {
   S.windowStatus = 'settling';
   broadcastState();
 
-  // Clean up all price feeds
   stopWS();
   stopRESTPoll();
   if (simTimer) { clearInterval(simTimer); simTimer = null; }
 
-  // Attempt to resolve from Polymarket
   let resolution = null;
   if (win.marketId) {
     for (let i = 0; i < 10 && !resolution; i++) {
@@ -693,8 +740,6 @@ async function endWindow(win) {
       }
     }
   }
-
-  // Price-based fallback if API didn't resolve
   if (!resolution) {
     resolution = (S.upPrice || 0.5) >= 0.5 ? 'up' : 'down';
     log(`⚡ Price-based resolution: ${resolution.toUpperCase()}`, 'warn');
@@ -713,13 +758,11 @@ async function endWindow(win) {
   log(`💰 Window PnL: $${windowPnl.toFixed(2)} | Capital: $${S.capital.toFixed(2)}`, 'info');
 
   S.windowHistory.unshift({
-    slug:          win.slug,
-    resolution,
-    pnl:           parseFloat(windowPnl.toFixed(2)),
-    capital:       parseFloat(S.capital.toFixed(2)),
+    slug: win.slug, resolution,
+    pnl: parseFloat(windowPnl.toFixed(2)),
+    capital: parseFloat(S.capital.toFixed(2)),
     activeLadders: S.activeLadders,
-    ts:            Date.now(),
-    simulated:     !!win.simulated,
+    ts: Date.now(), simulated: !!win.simulated,
   });
 
   S.windowStatus = 'waiting';
@@ -731,7 +774,7 @@ function startSim() {
   const now = Math.floor(Date.now() / 1000);
   const win = {
     slug: `btc-updown-15m-${now + 900}`, marketId: null,
-    endsAt: now + 900, ts: now, simulated: true, tokens: [],
+    endsAt: now + 900, ts: now, simulated: true,
     upTokenId: null, downTokenId: null,
   };
   S.currentWindow = win;
@@ -768,7 +811,6 @@ function broadcast(type, payload) {
     }
   }
 }
-
 function broadcastState() { broadcast('state', publicState()); }
 
 function publicState() {
@@ -836,7 +878,7 @@ function fmtLadder(l, price) {
 }
 
 // ============================================================
-//  EXPRESS + DASHBOARD WS SERVER
+//  EXPRESS + DASHBOARD WS
 // ============================================================
 const app = express();
 app.use(cors());
@@ -847,28 +889,19 @@ app.get('/api/health', (_, res) => res.json({ ok: true, uptime: process.uptime()
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server, path: '/ws' });
 
-// Dashboard WS: heartbeat to detect dead browser connections
 wss.on('connection', ws => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
-
   dashClients.add(ws);
-  try {
-    ws.send(JSON.stringify({ type: 'state', payload: publicState(), ts: Date.now() }));
-  } catch {}
-
-  ws.on('close',  () => dashClients.delete(ws));
-  ws.on('error',  () => { dashClients.delete(ws); try { ws.terminate(); } catch {} });
+  try { ws.send(JSON.stringify({ type: 'state', payload: publicState(), ts: Date.now() })); } catch {}
+  ws.on('close', () => dashClients.delete(ws));
+  ws.on('error', () => { dashClients.delete(ws); try { ws.terminate(); } catch {} });
 });
 
-// Ping all dashboard clients every 30s; terminate dead ones
+// Heartbeat: ping dashboard clients every 30s, drop dead ones
 setInterval(() => {
   for (const ws of dashClients) {
-    if (!ws.isAlive) {
-      dashClients.delete(ws);
-      try { ws.terminate(); } catch {}
-      continue;
-    }
+    if (!ws.isAlive) { dashClients.delete(ws); try { ws.terminate(); } catch {} continue; }
     ws.isAlive = false;
     try { ws.ping(); } catch {}
   }
@@ -877,6 +910,6 @@ setInterval(() => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`\n🚀 BTC Ladder Bot → http://localhost:${PORT}\n`);
-  log(`Bot started. Capital: $${S.capital} | Entry range: $${ENTRY_MIN}–$${ENTRY_MAX}`, 'success');
+  log(`Bot started. Capital: $${S.capital} | Entry: $${ENTRY_MIN}–$${ENTRY_MAX}`, 'success');
   setTimeout(findAndStart, 1000);
 });
