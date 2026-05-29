@@ -30,8 +30,8 @@ const fetch     = require('node-fetch');
 //  CONSTANTS
 // ============================================================
 const DEMO_CAPITAL   = 2000;
-const ENTRY_MIN      = 0.05;   // ← changed from 0.05
-const ENTRY_MAX      = 0.90;   // ← changed from 0.90
+const ENTRY_MIN      = 0.40;   // ← changed from 0.05
+const ENTRY_MAX      = 0.65;   // ← changed from 0.90
 const BUY_STEP       = 0.05;
 const SELL_PROFIT    = 0.10;
 const REENTRY_STEP   = 0.05;
