@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>BTC Ladder Bot</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet"/>
+<style>
+:root {
+  --bg:#080c10; --panel:rgba(16,24,32,0.9); --border:rgba(0,200,150,0.15); --border2:rgba(0,200,150,0.08);
+  --green:#00e5a0; --red:#ff3d71; --blue:#3d9eff; --yellow:#ffcc00; --dim:#3d5060;
+  --text:#c8dde8; --text2:#7a9aaa; --text3:#3d5565;
+  --glow-g:0 0 24px rgba(0,229,160,0.2);
+  --mono:'Space Mono',monospace; --head:'Syne',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:12px;min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(0,229,160,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,160,.02) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0}
+body::after{content:'';position:fixed;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,rgba(0,229,160,.35),transparent);animation:scan 5s linear infinite;pointer-events:none;z-index:999}
+@keyframes scan{from{top:-2px}to{top:100vh}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+@keyframes flashG{0%,100%{background:transparent}50%{background:rgba(0,229,160,.1)}}
+@keyframes flashR{0%,100%{background:transparent}50%{background:rgba(255,61,113,.1)}}
+.flash-g{animation:flashG .3s ease}
+.flash-r{animation:flashR .3s ease}
+.root{position:relative;z-index:1;padding:14px;min-height:100vh}
+.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding:12px 18px;background:var(--panel);border:1px solid var(--border);border-radius:12px;backdrop-filter:blur(12px);box-shadow:var(--glow-g)}
+.hdr-l{display:flex;align-items:center;gap:12px}
+.logo{font-family:var(--head);font-size:20px;font-weight:800;background:linear-gradient(135deg,var(--green),var(--blue));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo em{-webkit-text-fill-color:var(--yellow);font-style:normal}
+.badge{display:flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:9px;font-weight:700;letter-spacing:1px;border:1px solid}
+.badge-live{border-color:var(--green);color:var(--green)}
+.badge-sim{border-color:var(--yellow);color:var(--yellow)}
+.badge-up{border-color:var(--green);color:var(--green)}
+.badge-down{border-color:var(--red);color:var(--red)}
+.badge-both{border-color:var(--blue);color:var(--blue)}
+.bdot{width:5px;height:5px;border-radius:50%;background:currentColor;animation:pulse 1s ease infinite}
+.hdr-r{display:flex;gap:18px}
+.hs{text-align:right}
+.hs-l{color:var(--text2);font-size:9px;letter-spacing:1.5px;text-transform:uppercase}
+.hs-v{font-family:var(--head);font-size:15px;font-weight:700;margin-top:1px}
+.grid{display:grid;grid-template-columns:240px 1fr 1fr 240px;grid-template-rows:auto auto auto;gap:10px}
+.g-lt{grid-column:1;grid-row:1}.g-up{grid-column:2;grid-row:1/3}.g-dn{grid-column:3;grid-row:1/3}
+.g-rt{grid-column:4;grid-row:1}.g-lm{grid-column:1;grid-row:2}.g-rm{grid-column:4;grid-row:2}
+.g-log{grid-column:1/3;grid-row:3}.g-his{grid-column:3/5;grid-row:3}
+@media(max-width:1100px){.grid{grid-template-columns:1fr 1fr}.g-up{grid-column:1;grid-row:2}.g-dn{grid-column:2;grid-row:2}.g-log{grid-column:1/3}.g-his{grid-column:1/3}}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;backdrop-filter:blur(12px);overflow:hidden}
+.ph{display:flex;align-items:center;justify-content:space-between;padding:9px 13px 7px;border-bottom:1px solid var(--border2)}
+.pt{font-family:var(--head);font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text2)}
+.tag{font-size:9px;font-weight:700;letter-spacing:1px;padding:2px 7px;border-radius:20px;border:1px solid}
+.tag-g{color:var(--green);border-color:var(--green)}.tag-r{color:var(--red);border-color:var(--red)}
+.tag-b{color:var(--blue);border-color:var(--blue)}.tag-y{color:var(--yellow);border-color:var(--yellow)}
+.pb{padding:11px 13px}
+.price-big{font-family:var(--head);font-size:42px;font-weight:800;line-height:1;letter-spacing:-2px;margin:3px 0;transition:color .15s}
+.p-up{color:var(--green);text-shadow:0 0 28px rgba(0,229,160,.45)}
+.p-dn{color:var(--red);text-shadow:0 0 28px rgba(255,61,113,.45)}
+.p-mid{color:var(--text)}
+.pch{font-size:10px;font-weight:700;min-height:14px}
+.pmeta{color:var(--text2);font-size:9px;margin-top:5px}
+.lrows{display:flex;flex-direction:column;gap:3px;margin-top:3px}
+.lrow{display:flex;align-items:center;justify-content:space-between;padding:5px 9px;border-radius:5px;border:1px solid var(--border2);background:rgba(0,0,0,.2);font-size:10px}
+.lrow.act{border-color:rgba(0,229,160,.3);background:rgba(0,229,160,.05)}
+.lrow.act-dn{border-color:rgba(255,61,113,.3);background:rgba(255,61,113,.05)}
+.lep{color:var(--green);font-weight:700}.lep-dn{color:var(--red);font-weight:700}
+.lsh{color:var(--text2)}.lpnl{font-weight:700}
+.pos{color:var(--green)}.neg{color:var(--red)}
+.nop{text-align:center;padding:18px;color:var(--text3);font-size:10px;letter-spacing:1px;animation:blink 2s ease infinite}
+.mg{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.mc{padding:9px 11px;background:rgba(0,0,0,.3);border-radius:7px;border:1px solid var(--border2)}
+.ml{color:var(--text2);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:3px}
+.mv{font-family:var(--head);font-size:16px;font-weight:700}
+.cc{position:relative;height:150px;padding:4px 0 6px}
+.twrap{display:flex;flex-direction:column;align-items:center;padding:8px 0}
+.tring{position:relative;width:88px;height:88px;margin:3px auto}
+.tring svg{transform:rotate(-90deg)}
+.tc-bg{fill:none;stroke:rgba(0,229,160,.1);stroke-width:6}
+.tc{fill:none;stroke:var(--green);stroke-width:6;stroke-linecap:round;transition:stroke-dashoffset 1s linear}
+.ttext{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.tbig{font-family:var(--head);font-size:19px;font-weight:800;color:var(--green)}
+.tsml{font-size:8px;color:var(--text2);letter-spacing:1px}
+.tslug{font-size:8px;color:var(--text3);word-break:break-all;text-align:center;margin-top:3px;padding:0 6px}
+.tnext{font-size:8px;color:var(--blue);text-align:center;margin-top:5px;padding:3px 7px;border-radius:4px;background:rgba(61,158,255,.07);border:1px solid rgba(61,158,255,.2)}
+.logwrap{height:240px;overflow-y:auto;padding:6px 11px}
+.logwrap::-webkit-scrollbar{width:3px}
+.logwrap::-webkit-scrollbar-thumb{background:var(--dim);border-radius:2px}
+.le{display:flex;align-items:flex-start;gap:7px;padding:4px 0;border-bottom:1px solid var(--border2);font-size:9px;animation:fadeIn .3s ease}
+.lt{color:var(--text3);flex-shrink:0;width:42px}.lm{flex:1;line-height:1.4}
+.le.buy .lm{color:var(--green)}.le.sell .lm{color:var(--blue)}.le.success .lm{color:var(--green)}
+.le.error .lm{color:var(--red)}.le.warn .lm{color:var(--yellow)}.le.info .lm{color:var(--text)}
+.hiswrap{max-height:170px;overflow-y:auto;padding:4px 11px 7px}
+.hr{display:flex;align-items:center;justify-content:space-between;padding:4px 7px;margin-bottom:3px;border-radius:5px;border:1px solid var(--border2);font-size:9px}
+.hr.win{border-color:rgba(0,229,160,.2);background:rgba(0,229,160,.03)}
+.hr.loss{border-color:rgba(255,61,113,.2);background:rgba(255,61,113,.03)}
+.hslug{color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:8px}
+.hpnl{font-weight:700;width:55px;text-align:right}
+.hres{width:28px;text-align:center}.hadder{font-size:8px;color:var(--text3);width:30px;text-align:right}
+.cbar-track{height:4px;background:rgba(255,255,255,.05);border-radius:2px;overflow:hidden;margin:3px 0}
+.cbar-fill{height:100%;border-radius:2px;transition:width .5s,background .3s}
+.sbar{display:flex;align-items:center;gap:9px;margin-top:10px;padding:7px 14px;background:var(--panel);border:1px solid var(--border);border-radius:7px}
+.sdot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.stxt{color:var(--text2);font-size:9px}.sright{margin-left:auto;color:var(--text3);font-size:8px}
+.dvd{height:1px;background:var(--border2);margin:7px 0}
+.inactive-overlay{display:flex;align-items:center;justify-content:center;padding:24px;flex-direction:column;gap:8px;opacity:.45}
+.inactive-overlay .io-icon{font-size:28px}
+.inactive-overlay .io-text{font-size:10px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;text-align:center}
+</style>
+</head>
+<body>
+<div class="root">
+
+<div class="hdr">
+  <div class="hdr-l">
+    <div class="logo">BTC<em>⚡</em>LADDER</div>
+    <div class="badge badge-live" id="modeBadge"><div class="bdot"></div><span id="modeText">CONNECTING</span></div>
+    <div class="badge badge-both" id="ladderBadge"><div class="bdot"></div><span id="ladderText">BOTH ACTIVE</span></div>
+    <div class="badge" id="wsBadge" style="border-color:var(--red);color:var(--red)">
+      <div class="bdot"></div><span id="wsText">WS OFFLINE</span>
+    </div>
+  </div>
+  <div class="hdr-r">
+    <div class="hs"><div class="hs-l">Floating Capital</div><div class="hs-v" id="hFloat" style="color:var(--green)">$2,000.00</div></div>
+    <div class="hs"><div class="hs-l">Total P&L</div><div class="hs-v" id="hPnl">$0.00</div></div>
+    <div class="hs"><div class="hs-l">Win Rate</div><div class="hs-v" id="hWr" style="color:var(--blue)">—</div></div>
+    <div class="hs"><div class="hs-l">Windows</div><div class="hs-v" id="hWin" style="color:var(--text2)">0</div></div>
+  </div>
+</div>
+
+<div class="grid">
+
+  <div class="panel g-lt">
+    <div class="ph"><span class="pt">Window</span><span class="tag tag-b" id="wstag">SEARCHING</span></div>
+    <div class="pb">
+      <div class="twrap">
+        <div class="tring">
+          <svg viewBox="0 0 90 90" width="88" height="88">
+            <circle class="tc-bg" cx="45" cy="45" r="38"/>
+            <circle class="tc" id="tc" cx="45" cy="45" r="38" stroke-dasharray="238.76" stroke-dashoffset="0"/>
+          </svg>
+          <div class="ttext"><div class="tbig" id="tbig">--:--</div><div class="tsml">LEFT</div></div>
+        </div>
+        <div class="tslug" id="tslug">Searching...</div>
+        <div class="tnext" id="tnext" style="display:none">⏭ <span id="tnextslug"></span></div>
+      </div>
+      <div class="dvd"></div>
+      <div class="ml" style="margin-bottom:5px;font-size:9px;color:var(--text2);letter-spacing:1.5px">CAPITAL UTILIZATION</div>
+      <div style="display:flex;justify-content:space-between;font-size:9px;margin-bottom:2px">
+        <span style="color:var(--text2)">DEPLOYED</span><span id="capPct">0%</span>
+      </div>
+      <div class="cbar-track"><div class="cbar-fill" id="cbar" style="width:0%;background:var(--green)"></div></div>
+      <div style="display:flex;justify-content:space-between;margin-top:7px">
+        <div><div class="ml">Cash</div><div style="font-size:12px;font-weight:700" id="cashV">$2,000</div></div>
+        <div style="text-align:right"><div class="ml">In Positions</div><div style="font-size:12px;font-weight:700;color:var(--yellow)" id="posV">$0</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel g-up" id="panelUp">
+    <div class="ph"><span class="pt">UP Ladder</span><span class="tag tag-g" id="upTag">BUY UP</span></div>
+    <div class="pb" style="padding-bottom:0" id="upBody">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:3px">
+        <div>
+          <div class="pmeta">UP TOKEN PRICE</div>
+          <div class="price-big p-up" id="upPrice">-.----</div>
+          <div class="pch" id="upCh" style="color:var(--text2)">—</div>
+        </div>
+        <div style="text-align:right">
+          <div class="ml">Avg Entry</div><div style="font-size:14px;font-weight:700;color:var(--green)" id="upAvg">—</div>
+          <div class="ml" style="margin-top:3px">Next Buy @</div><div style="font-size:12px;font-weight:700;color:var(--yellow)" id="upNext">—</div>
+        </div>
+      </div>
+      <div class="cc"><canvas id="chartUp"></canvas></div>
+      <div class="dvd"></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0 3px">
+        <span style="font-size:9px;color:var(--text2);letter-spacing:1px">POSITIONS</span>
+        <span style="font-size:9px" id="upTot">0 sh</span>
+      </div>
+      <div class="lrows" id="upRows"><div class="nop">Waiting for entry...</div></div>
+      <div class="dvd"></div>
+      <div class="mg" style="margin-top:5px;padding-bottom:9px">
+        <div class="mc"><div class="ml">Unrealized P&L</div><div class="mv" id="upUnreal" style="font-size:13px">$0.00</div></div>
+        <div class="mc"><div class="ml">Re-entry Price</div><div class="mv" id="upReentry" style="font-size:13px;color:var(--yellow)">$0.55</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel g-dn" id="panelDown">
+    <div class="ph"><span class="pt">DOWN Ladder</span><span class="tag tag-r" id="dnTag">BUY DOWN</span></div>
+    <div class="pb" style="padding-bottom:0" id="dnBody">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:3px">
+        <div>
+          <div class="pmeta">DOWN TOKEN PRICE</div>
+          <div class="price-big p-dn" id="dnPrice">-.----</div>
+          <div class="pch" id="dnCh" style="color:var(--text2)">—</div>
+        </div>
+        <div style="text-align:right">
+          <div class="ml">Avg Entry</div><div style="font-size:14px;font-weight:700;color:var(--red)" id="dnAvg">—</div>
+          <div class="ml" style="margin-top:3px">Next Buy @</div><div style="font-size:12px;font-weight:700;color:var(--yellow)" id="dnNext">—</div>
+        </div>
+      </div>
+      <div class="cc"><canvas id="chartDown"></canvas></div>
+      <div class="dvd"></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0 3px">
+        <span style="font-size:9px;color:var(--text2);letter-spacing:1px">POSITIONS</span>
+        <span style="font-size:9px" id="dnTot">0 sh</span>
+      </div>
+      <div class="lrows" id="dnRows"><div class="nop">Waiting for entry...</div></div>
+      <div class="dvd"></div>
+      <div class="mg" style="margin-top:5px;padding-bottom:9px">
+        <div class="mc"><div class="ml">Unrealized P&L</div><div class="mv" id="dnUnreal" style="font-size:13px">$0.00</div></div>
+        <div class="mc"><div class="ml">Re-entry Price</div><div class="mv" id="dnReentry" style="font-size:13px;color:var(--yellow)">$0.55</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel g-rt">
+    <div class="ph"><span class="pt">Performance</span><span class="tag tag-b">SESSION</span></div>
+    <div class="pb">
+      <div class="mg">
+        <div class="mc"><div class="ml">Start</div><div class="mv" style="font-size:13px;color:var(--text2)">$2,000</div></div>
+        <div class="mc"><div class="ml">Current</div><div class="mv" style="font-size:13px" id="capNow">$2,000</div></div>
+        <div class="mc"><div class="ml">Total P&L</div><div class="mv" style="font-size:13px" id="pnlCard">$0.00</div></div>
+        <div class="mc"><div class="ml">ROI</div><div class="mv" style="font-size:13px" id="roiCard">0.00%</div></div>
+      </div>
+      <div class="dvd"></div>
+      <div class="mg">
+        <div class="mc"><div class="ml">Wins</div><div class="mv" style="color:var(--green)" id="winsC">0</div></div>
+        <div class="mc"><div class="ml">Losses</div><div class="mv" style="color:var(--red)" id="lossC">0</div></div>
+      </div>
+      <div style="margin-top:9px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+          <span style="font-size:8px;color:var(--green);letter-spacing:1px">WIN RATE</span>
+          <span style="font-size:9px;font-weight:700" id="wrPct">—</span>
+        </div>
+        <div style="height:5px;background:rgba(255,61,113,.25);border-radius:3px;overflow:hidden">
+          <div id="wrBar" style="height:100%;background:var(--green);border-radius:3px;width:0%;transition:width .5s"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel g-lm">
+    <div class="ph"><span class="pt">Strategy</span><span class="tag tag-y">RULES</span></div>
+    <div class="pb">
+      <div style="display:flex;flex-direction:column;gap:6px;font-size:9px;line-height:1.5">
+        <div style="display:flex;gap:6px"><span style="color:var(--green)">►</span><span style="color:var(--text2)">Entry: <span style="color:var(--text)">$0.55 – $0.90</span></span></div>
+        <div style="display:flex;gap:6px"><span style="color:var(--green)">►</span><span style="color:var(--text2)">Buy <span style="color:var(--text)">100 sh</span> every <span style="color:var(--yellow)">-$0.05</span></span></div>
+        <div style="display:flex;gap:6px"><span style="color:var(--blue)">►</span><span style="color:var(--text2)">Sell all at <span style="color:var(--green)">avg + $0.10</span></span></div>
+        <div style="display:flex;gap:6px"><span style="color:var(--blue)">►</span><span style="color:var(--text2)">Re-entry: <span style="color:var(--yellow)">last sell – $0.05</span></span></div>
+        <div style="display:flex;gap:6px"><span style="color:var(--red)">►</span><span style="color:var(--text2)"><span style="color:var(--red)">No stop loss</span></span></div>
+        <div class="dvd"></div>
+        <div style="color:var(--yellow);font-size:9px;letter-spacing:1px;margin-bottom:2px">LADDER SELECTION</div>
+        <div style="display:flex;gap:6px"><span style="color:var(--yellow)">▸</span><span style="color:var(--text2)">Prev UP → <span style="color:var(--green)">UP only</span></span></div>
+        <div style="display:flex;gap:6px"><span style="color:var(--yellow)">▸</span><span style="color:var(--text2)">Prev DOWN → <span style="color:var(--red)">DOWN only</span></span></div>
+        <div style="display:flex;gap:6px"><span style="color:var(--yellow)">▸</span><span style="color:var(--text2)">First window → <span style="color:var(--blue)">BOTH</span></span></div>
+        <div class="dvd"></div>
+        <div style="display:flex;gap:6px"><span style="color:var(--text3)">►</span><span style="color:var(--text2)">Prev result: <span id="prevRes" style="color:var(--text);font-weight:700">—</span></span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel g-rm">
+    <div class="ph"><span class="pt">Bot Status</span><span class="tag tag-b" id="botTag">ACTIVE</span></div>
+    <div class="pb">
+      <div style="font-size:10px;color:var(--text2);margin-bottom:8px">
+        Status: <span id="botStat" style="color:var(--green)">Starting...</span>
+      </div>
+      <div class="dvd"></div>
+      <div style="margin-top:6px;font-size:9px;display:flex;flex-direction:column;gap:4px">
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Last Tick</span><span id="lastTick" style="color:var(--text2)">—</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Feed</span><span id="feedStat" style="color:var(--yellow)">—</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Active Ladders</span><span id="actLad" style="color:var(--blue)">—</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Up Token</span><span id="upTok" style="color:var(--text3);font-size:8px">—</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Down Token</span><span id="dnTok" style="color:var(--text3);font-size:8px">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel g-log">
+    <div class="ph"><span class="pt">Trade Log</span><span class="tag tag-b">LIVE</span></div>
+    <div class="logwrap" id="logEl"></div>
+  </div>
+
+  <div class="panel g-his">
+    <div class="ph"><span class="pt">Window History</span><span class="tag tag-b" id="hisCnt">0 windows</span></div>
+    <div class="hiswrap" id="hisEl"></div>
+  </div>
+
+</div>
+
+<div class="sbar">
+  <div class="sdot" id="sdot" style="background:var(--yellow)"></div>
+  <span class="stxt" id="stxt">Connecting...</span>
+  <span class="sright" id="sup">—</span>
+</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+let S={}, ws=null, upChart=null, dnChart=null, prevUp=null, prevDn=null;
+
+function mkChart(id, color) {
+  const ctx = document.getElementById(id).getContext('2d');
+  return new Chart(ctx, {
+    type:'line',
+    data:{ labels:[], datasets:[{ data:[], borderColor:color,
+      backgroundColor:color.replace('rgb','rgba').replace(')',',0.07)'),
+      borderWidth:1.5, pointRadius:0, tension:0.3, fill:true }] },
+    options:{ responsive:true, maintainAspectRatio:false, animation:false,
+      plugins:{ legend:{display:false}, tooltip:{enabled:false} },
+      scales:{ x:{display:false}, y:{ display:true, min:0.28, max:1.0,
+        grid:{color:'rgba(255,255,255,0.04)'}, ticks:{color:'#3d5060',font:{size:8},maxTicksLimit:4,callback:v=>'$'+v.toFixed(2)} } } }
+  });
+}
+
+window.onload = () => {
+  upChart = mkChart('chartUp',  'rgb(0,229,160)');
+  dnChart = mkChart('chartDown','rgb(255,61,113)');
+  connectWS();
+};
+
+function connectWS() {
+  const proto = location.protocol==='https:'?'wss:':'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen  = () => setStatus('green','Connected');
+  ws.onmessage = e => { try { const m=JSON.parse(e.data); if(m.type==='state') render(m.payload); else if(m.type==='log') addLog(m.payload); } catch{} };
+  ws.onclose = () => { setStatus('yellow','Reconnecting...'); setTimeout(connectWS,3000); };
+  ws.onerror = () => ws.close();
+}
+
+function render(s) {
+  S = s;
+  const fl = s.floatingCapital || s.capital;
+  el('hFloat').textContent = '$'+fl.toFixed(2);
+  el('hFloat').style.color = fl >= s.startCapital ? 'var(--green)' : 'var(--red)';
+  const pnl = s.totalPnl||0;
+  el('hPnl').textContent = (pnl>=0?'+':'')+'$'+pnl.toFixed(2);
+  el('hPnl').style.color = pnl>=0?'var(--green)':'var(--red)';
+  el('hWr').textContent  = s.winRate ? s.winRate+'%' : '—';
+  el('hWin').textContent = s.windowsTraded||0;
+
+  const live = s.currentWindow && !s.currentWindow.simulated;
+  el('modeBadge').className = 'badge '+(live?'badge-live':'badge-sim');
+  el('modeText').textContent = s.windowStatus==='active'?(live?'LIVE':'SIMULATED'):s.windowStatus.toUpperCase();
+
+  const al = s.activeLadders||'both';
+  el('ladderBadge').className = 'badge '+(al==='up'?'badge-up':al==='down'?'badge-down':'badge-both');
+  el('ladderText').textContent = al==='up'?'UP ONLY':al==='down'?'DOWN ONLY':'BOTH ACTIVE';
+
+  const wsStyle = s.wsConnected
+    ? 'border:1px solid var(--green);color:var(--green);'
+    : 'border:1px solid var(--red);color:var(--red);';
+  el('wsBadge').style.cssText = wsStyle+'display:flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:9px;font-weight:700;letter-spacing:1px';
+  el('wsText').textContent = s.wsConnected?'WS LIVE':'WS OFFLINE';
+
+  renderTimer(s.currentWindow);
+
+  const dep = (s.upLadder?.totalCost||0)+(s.downLadder?.totalCost||0);
+  const pct = Math.min(100, dep/s.startCapital*100);
+  el('cbar').style.width = pct+'%';
+  el('cbar').style.background = pct>70?'var(--red)':pct>40?'var(--yellow)':'var(--green)';
+  el('capPct').textContent = pct.toFixed(0)+'%';
+  el('cashV').textContent  = '$'+s.capital.toFixed(2);
+  el('posV').textContent   = '$'+dep.toFixed(2);
+
+  renderPrice('up', s.upPrice,   s.priceHistory?.up);
+  renderPrice('dn', s.downPrice, s.priceHistory?.down);
+  renderLadder('up', s.upLadder,   s.upPrice,   al==='down');
+  renderLadder('dn', s.downLadder, s.downPrice, al==='up');
+
+  el('capNow').textContent  = '$'+s.capital.toFixed(2);
+  el('capNow').style.color  = s.capital>=s.startCapital?'var(--green)':'var(--red)';
+  const roi = (s.capital-s.startCapital)/s.startCapital*100;
+  el('pnlCard').textContent = (pnl>=0?'+':'')+'$'+pnl.toFixed(2);
+  el('pnlCard').style.color = pnl>=0?'var(--green)':'var(--red)';
+  el('roiCard').textContent = (roi>=0?'+':'')+roi.toFixed(2)+'%';
+  el('roiCard').style.color = roi>=0?'var(--green)':'var(--red)';
+  el('winsC').textContent   = s.wins||0;
+  el('lossC').textContent   = s.losses||0;
+  const wr = parseFloat(s.winRate||0);
+  el('wrPct').textContent   = s.windowsTraded>0?wr+'%':'—';
+  el('wrBar').style.width   = wr+'%';
+
+  const pr = s.lastResolution;
+  el('prevRes').textContent = pr?pr.toUpperCase():'—';
+  el('prevRes').style.color = pr==='up'?'var(--green)':pr==='down'?'var(--red)':'var(--text)';
+
+  el('botStat').textContent = s.botStatus||'—';
+  el('botStat').style.color = s.windowStatus==='active'?'var(--green)':'var(--yellow)';
+  el('actLad').textContent  = al.toUpperCase();
+  el('actLad').style.color  = al==='both'?'var(--blue)':al==='up'?'var(--green)':'var(--red)';
+  el('upTok').textContent   = s.upTokenId   ? s.upTokenId.slice(0,14)+'...'   : '—';
+  el('dnTok').textContent   = s.downTokenId ? s.downTokenId.slice(0,14)+'...' : '—';
+  el('feedStat').textContent = s.wsConnected?'WEBSOCKET':'POLLING';
+  el('feedStat').style.color = s.wsConnected?'var(--green)':'var(--yellow)';
+  if (s.lastPriceUpdate) {
+    const ago = Math.floor((Date.now()-s.lastPriceUpdate)/1000);
+    el('lastTick').textContent = ago===0?'just now':ago+'s ago';
+  }
+
+  const lw = el('logEl'); lw.innerHTML='';
+  (s.tradeLog||[]).forEach(e => addLogTo(lw, e));
+  renderHistory(s.windowHistory||[]);
+
+  el('wstag').textContent = (s.windowStatus||'').toUpperCase();
+  el('sup').textContent   = 'Updated '+new Date().toLocaleTimeString();
+  setStatus('green','Bot: '+s.botStatus);
+}
+
+function renderPrice(side, price, history) {
+  const isUp = side==='up';
+  const prEl = el(side+'Price'), chEl = el(side+'Ch');
+  const prev = isUp?prevUp:prevDn;
+  if (price===null||price===undefined) return;
+  prEl.textContent = '$'+price.toFixed(4);
+  prEl.className   = 'price-big '+(price>=0.55?(isUp?'p-up':'p-dn'):'p-mid');
+  if (prev!==null) {
+    const d = price-prev;
+    chEl.innerHTML = `<span style="color:${d>=0?'var(--green)':'var(--red)'}">${d>=0?'▲':'▼'} ${Math.abs(d*100).toFixed(2)}%</span>`;
+  }
+  if (isUp) prevUp=price; else prevDn=price;
+  const chart = isUp?upChart:dnChart;
+  if (history&&history.length>0) {
+    chart.data.labels = history.map((_,i)=>i);
+    chart.data.datasets[0].data = history.map(h=>h.price||h);
+    chart.update('none');
+  }
+}
+
+function renderLadder(side, ladder, price, inactive) {
+  const isUp  = side==='up';
+  const rows  = el(side+'Rows'), tot=el(side+'Tot'), avg=el(side+'Avg');
+  const nxt   = el(side+'Next'), unr=el(side+'Unreal'), ren=el(side+'Reentry');
+  const body  = el(isUp?'upBody':'dnBody');
+
+  if (inactive) {
+    body.style.opacity='0.3'; body.style.pointerEvents='none';
+    rows.innerHTML=`<div class="inactive-overlay"><div class="io-icon">${isUp?'📈':'📉'}</div><div class="io-text">Inactive this window<br>based on prev result</div></div>`;
+    tot.textContent='INACTIVE'; avg.textContent='—'; nxt.textContent='—'; unr.textContent='$0.00'; ren.textContent='—';
+    return;
+  }
+  body.style.opacity='1'; body.style.pointerEvents='auto';
+
+  if (!ladder||ladder.totalShares===0) {
+    rows.innerHTML='<div class="nop">Waiting for entry...</div>';
+    tot.textContent='0 sh'; avg.textContent='—';
+    nxt.textContent = price>=0.55&&price<=0.90?'$'+(price-0.05).toFixed(2):'Wait $0.55';
+    unr.textContent='$0.00'; unr.style.color='var(--text2)';
+    ren.textContent = ladder?.lastSoldPrice?'$'+((ladder.lastSoldPrice-0.05).toFixed(2)):'$0.55';
+    return;
+  }
+  tot.textContent = ladder.totalShares+' sh · $'+ladder.totalCost.toFixed(2);
+  avg.textContent = '$'+ladder.avgEntry.toFixed(4);
+  nxt.textContent = ladder.nextBuy?'$'+ladder.nextBuy.toFixed(4):'—';
+  ren.textContent = '$'+ladder.reEntry.toFixed(2);
+  const u = ladder.unrealizedPnl||0;
+  unr.textContent = (u>=0?'+':'')+'$'+u.toFixed(2);
+  unr.style.color = u>=0?'var(--green)':'var(--red)';
+  const cls = isUp?'act':'act-dn', epcls = isUp?'lep':'lep-dn';
+  rows.innerHTML = (ladder.positions||[]).slice(0,8).map(p=>{
+    const pnl = price?p.shares*price-p.shares*p.price:0;
+    return `<div class="lrow ${cls}"><span class="${epcls}">$${p.price.toFixed(4)}</span><span class="lsh">${p.shares}sh</span><span class="lpnl ${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</span></div>`;
+  }).join('')||'<div class="nop">No positions</div>';
+}
+
+function renderTimer(win) {
+  if (!win) { el('tbig').textContent='--:--'; el('tslug').textContent='Searching...'; return; }
+  const now  = Math.floor(Date.now()/1000);
+  const left = Math.max(0, win.timeLeft!==undefined?win.timeLeft:win.endsAt-now);
+  el('tc').style.strokeDashoffset = 238.76*(1-(left/900));
+  const m=Math.floor(left/60).toString().padStart(2,'0'), sec=(left%60).toString().padStart(2,'0');
+  el('tbig').textContent=m+':'+sec;
+  el('tbig').style.color = left<60?'var(--red)':left<180?'var(--yellow)':'var(--green)';
+  el('tc').style.stroke  = left<60?'var(--red)':left<180?'var(--yellow)':'var(--green)';
+  el('tslug').textContent = win.slug||'—';
+  if (S.nextWindow) { el('tnext').style.display='block'; el('tnextslug').textContent=S.nextWindow.slug||'—'; }
+  else el('tnext').style.display='none';
+}
+setInterval(()=>{ if(S.currentWindow){ const now=Math.floor(Date.now()/1000); renderTimer({...S.currentWindow,timeLeft:Math.max(0,S.currentWindow.endsAt-now)}); }},1000);
+
+function addLog(e) { addLogTo(el('logEl'), e); }
+function addLogTo(c, e) {
+  const d=document.createElement('div');
+  d.className='le '+(e.type||'info');
+  const t=new Date(e.ts);
+  const tm=t.getHours().toString().padStart(2,'0')+':'+t.getMinutes().toString().padStart(2,'0')+':'+t.getSeconds().toString().padStart(2,'0');
+  d.innerHTML=`<span class="lt">${tm}</span><span class="lm">${e.msg}</span>`;
+  c.insertBefore(d,c.firstChild);
+  while(c.children.length>80) c.removeChild(c.lastChild);
+}
+
+function renderHistory(h) {
+  el('hisCnt').textContent=h.length+' windows';
+  const w=el('hisEl');
+  if(!h.length){ w.innerHTML='<div style="text-align:center;padding:18px;color:var(--text3);font-size:10px">No completed windows</div>'; return; }
+  w.innerHTML=h.map(x=>{
+    const al=x.activeLadders||'both';
+    return `<div class="hr ${x.pnl>=0?'win':'loss'}">
+      <span class="hslug">${x.slug||'—'}${x.simulated?' 🎮':''}</span>
+      <span class="hadder" style="color:${al==='up'?'var(--green)':al==='down'?'var(--red)':'var(--blue)'}">${al.toUpperCase()}</span>
+      <span class="hres" style="color:${x.resolution==='up'?'var(--green)':'var(--red)'}">${(x.resolution||'').toUpperCase()}</span>
+      <span class="hpnl ${x.pnl>=0?'pos':'neg'}">${x.pnl>=0?'+':''}$${x.pnl.toFixed(2)}</span>
+    </div>`;
+  }).join('');
+}
+
+function setStatus(c,t) {
+  el('sdot').style.background = c==='green'?'var(--green)':c==='yellow'?'var(--yellow)':'var(--red)';
+  el('sdot').style.boxShadow  = c==='green'?'0 0 7px var(--green)':'none';
+  el('stxt').textContent=t;
+}
+function el(id){ return document.getElementById(id); }
+</script>
+</body>
+</html>
