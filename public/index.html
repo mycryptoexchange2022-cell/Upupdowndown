@@ -105,6 +105,11 @@ body::after{content:'';position:fixed;left:0;right:0;height:2px;background:linea
 .inactive-overlay{display:flex;align-items:center;justify-content:center;padding:24px;flex-direction:column;gap:8px;opacity:.45}
 .inactive-overlay .io-icon{font-size:28px}
 .inactive-overlay .io-text{font-size:10px;color:var(--text3);letter-spacing:1.5px;text-transform:uppercase;text-align:center}
+.src-badge{font-size:8px;padding:1px 5px;border-radius:3px;letter-spacing:1px;font-weight:700;margin-left:6px}
+.src-ws{background:rgba(0,229,160,.15);color:var(--green)}
+.src-clob{background:rgba(61,158,255,.15);color:var(--blue)}
+.src-gamma{background:rgba(255,204,0,.15);color:var(--yellow)}
+.src-sim{background:rgba(255,61,113,.15);color:var(--red)}
 </style>
 </head>
 <body>
@@ -161,7 +166,7 @@ body::after{content:'';position:fixed;left:0;right:0;height:2px;background:linea
     <div class="pb" style="padding-bottom:0" id="upBody">
       <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:3px">
         <div>
-          <div class="pmeta">UP TOKEN PRICE</div>
+          <div class="pmeta">UP TOKEN PRICE <span class="src-badge" id="upSrcBadge"></span></div>
           <div class="price-big p-up" id="upPrice">-.----</div>
           <div class="pch" id="upCh" style="color:var(--text2)">—</div>
         </div>
@@ -190,7 +195,7 @@ body::after{content:'';position:fixed;left:0;right:0;height:2px;background:linea
     <div class="pb" style="padding-bottom:0" id="dnBody">
       <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:3px">
         <div>
-          <div class="pmeta">DOWN TOKEN PRICE</div>
+          <div class="pmeta">DOWN TOKEN PRICE <span class="src-badge" id="dnSrcBadge"></span></div>
           <div class="price-big p-dn" id="dnPrice">-.----</div>
           <div class="pch" id="dnCh" style="color:var(--text2)">—</div>
         </div>
@@ -244,7 +249,7 @@ body::after{content:'';position:fixed;left:0;right:0;height:2px;background:linea
     <div class="ph"><span class="pt">Strategy</span><span class="tag tag-y">RULES</span></div>
     <div class="pb">
       <div style="display:flex;flex-direction:column;gap:6px;font-size:9px;line-height:1.5">
-        <div style="display:flex;gap:6px"><span style="color:var(--green)">►</span><span style="color:var(--text2)">Entry: <span style="color:var(--text)">$0.55 – $0.90</span></span></div>
+        <div style="display:flex;gap:6px"><span style="color:var(--green)">►</span><span style="color:var(--text2)">Entry: <span style="color:var(--text)">$0.05 – $0.90</span></span></div>
         <div style="display:flex;gap:6px"><span style="color:var(--green)">►</span><span style="color:var(--text2)">Buy <span style="color:var(--text)">100 sh</span> every <span style="color:var(--yellow)">-$0.05</span></span></div>
         <div style="display:flex;gap:6px"><span style="color:var(--blue)">►</span><span style="color:var(--text2)">Sell all at <span style="color:var(--green)">avg + $0.10</span></span></div>
         <div style="display:flex;gap:6px"><span style="color:var(--blue)">►</span><span style="color:var(--text2)">Re-entry: <span style="color:var(--yellow)">last sell – $0.05</span></span></div>
@@ -270,6 +275,7 @@ body::after{content:'';position:fixed;left:0;right:0;height:2px;background:linea
       <div style="margin-top:6px;font-size:9px;display:flex;flex-direction:column;gap:4px">
         <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Last Tick</span><span id="lastTick" style="color:var(--text2)">—</span></div>
         <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Feed</span><span id="feedStat" style="color:var(--yellow)">—</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Price Source</span><span id="priceSrc" style="color:var(--text2)">—</span></div>
         <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Active Ladders</span><span id="actLad" style="color:var(--blue)">—</span></div>
         <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Up Token</span><span id="upTok" style="color:var(--text3);font-size:8px">—</span></div>
         <div style="display:flex;justify-content:space-between"><span style="color:var(--text3)">Down Token</span><span id="dnTok" style="color:var(--text3);font-size:8px">—</span></div>
@@ -299,6 +305,8 @@ body::after{content:'';position:fixed;left:0;right:0;height:2px;background:linea
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script>
 let S={}, ws=null, upChart=null, dnChart=null, prevUp=null, prevDn=null;
+// FIX: Track recent min/max for auto-scaling charts
+let upPriceRange={min:1,max:0}, dnPriceRange={min:1,max:0};
 
 function mkChart(id, color) {
   const ctx = document.getElementById(id).getContext('2d');
@@ -309,8 +317,10 @@ function mkChart(id, color) {
       borderWidth:1.5, pointRadius:0, tension:0.3, fill:true }] },
     options:{ responsive:true, maintainAspectRatio:false, animation:false,
       plugins:{ legend:{display:false}, tooltip:{enabled:false} },
-      scales:{ x:{display:false}, y:{ display:true, min:0.28, max:1.0,
-        grid:{color:'rgba(255,255,255,0.04)'}, ticks:{color:'#3d5060',font:{size:8},maxTicksLimit:4,callback:v=>'$'+v.toFixed(2)} } } }
+      // FIX: Remove fixed min/max — let Chart.js auto-scale from data
+      scales:{ x:{display:false}, y:{ display:true,
+        grid:{color:'rgba(255,255,255,0.04)'},
+        ticks:{color:'#3d5060',font:{size:8},maxTicksLimit:4,callback:v=>'$'+v.toFixed(2)} } } }
   });
 }
 
@@ -364,8 +374,8 @@ function render(s) {
   el('cashV').textContent  = '$'+s.capital.toFixed(2);
   el('posV').textContent   = '$'+dep.toFixed(2);
 
-  renderPrice('up', s.upPrice,   s.priceHistory?.up);
-  renderPrice('dn', s.downPrice, s.priceHistory?.down);
+  renderPrice('up', s.upPrice,   s.priceHistory?.up,   s.priceSource);
+  renderPrice('dn', s.downPrice, s.priceHistory?.down, s.priceSource);
   renderLadder('up', s.upLadder,   s.upPrice,   al==='down');
   renderLadder('dn', s.downLadder, s.downPrice, al==='up');
 
@@ -394,9 +404,19 @@ function render(s) {
   el('dnTok').textContent   = s.downTokenId ? s.downTokenId.slice(0,14)+'...' : '—';
   el('feedStat').textContent = s.wsConnected?'WEBSOCKET':'POLLING';
   el('feedStat').style.color = s.wsConnected?'var(--green)':'var(--yellow)';
+
+  // FIX: Show price source
+  const srcMap = {ws:'WS',clob:'CLOB REST',gamma:'GAMMA API',sim:'SIMULATED',none:'—'};
+  const srcColorMap = {ws:'var(--green)',clob:'var(--blue)',gamma:'var(--yellow)',sim:'var(--red)',none:'var(--text3)'};
+  const src = s.priceSource||'none';
+  el('priceSrc').textContent = srcMap[src]||src.toUpperCase();
+  el('priceSrc').style.color = srcColorMap[src]||'var(--text2)';
+
   if (s.lastPriceUpdate) {
     const ago = Math.floor((Date.now()-s.lastPriceUpdate)/1000);
     el('lastTick').textContent = ago===0?'just now':ago+'s ago';
+    // FIX: Turn red if stale >15s
+    el('lastTick').style.color = ago>15?'var(--red)':ago>8?'var(--yellow)':'var(--green)';
   }
 
   const lw = el('logEl'); lw.innerHTML='';
@@ -408,30 +428,56 @@ function render(s) {
   setStatus('green','Bot: '+s.botStatus);
 }
 
-function renderPrice(side, price, history) {
+// FIX: renderPrice — correct % change calc and auto-scale chart
+function renderPrice(side, price, history, priceSource) {
   const isUp = side==='up';
   const prEl = el(side+'Price'), chEl = el(side+'Ch');
   const prev = isUp?prevUp:prevDn;
   if (price===null||price===undefined) return;
+
+  // Update display
   prEl.textContent = '$'+price.toFixed(4);
-  prEl.className   = 'price-big '+(price>=0.55?(isUp?'p-up':'p-dn'):'p-mid');
-  if (prev!==null) {
-    const d = price-prev;
-    chEl.innerHTML = `<span style="color:${d>=0?'var(--green)':'var(--red)'}">${d>=0?'▲':'▼'} ${Math.abs(d*100).toFixed(2)}%</span>`;
+  // Color based on side regardless of price level
+  prEl.className   = 'price-big '+(isUp?'p-up':'p-dn');
+
+  // FIX: correct % change: (delta / prev) * 100, not delta * 100
+  if (prev!==null && prev>0) {
+    const d   = price - prev;
+    const pct = (d / prev * 100);
+    chEl.innerHTML = `<span style="color:${d>=0?'var(--green)':'var(--red)'}">${d>=0?'▲':'▼'} ${Math.abs(pct).toFixed(3)}%</span>`;
   }
   if (isUp) prevUp=price; else prevDn=price;
+
+  // Update source badge
+  const srcEl = el(isUp?'upSrcBadge':'dnSrcBadge');
+  if (srcEl && priceSource) {
+    const srcMap = {ws:'WS',clob:'CLOB',gamma:'GAMMA',sim:'SIM',none:''};
+    srcEl.textContent = srcMap[priceSource]||'';
+    srcEl.className = 'src-badge src-'+(priceSource||'none');
+  }
+
+  // Update chart
   const chart = isUp?upChart:dnChart;
-  if (history&&history.length>0) {
+  if (history&&history.length>1) {
+    const prices = history.map(h=>h.price||h);
     chart.data.labels = history.map((_,i)=>i);
-    chart.data.datasets[0].data = history.map(h=>h.price||h);
+    chart.data.datasets[0].data = prices;
+
+    // FIX: Auto-scale chart with 10% padding around actual range
+    const minP = Math.min(...prices);
+    const maxP = Math.max(...prices);
+    const pad  = Math.max((maxP - minP) * 0.3, 0.03);
+    chart.options.scales.y.min = Math.max(0.01, parseFloat((minP - pad).toFixed(3)));
+    chart.options.scales.y.max = Math.min(0.99, parseFloat((maxP + pad).toFixed(3)));
+
     chart.update('none');
   }
 }
 
 function renderLadder(side, ladder, price, inactive) {
   const isUp  = side==='up';
-  const rows  = el(side+'Rows'), tot=el(side+'Tot'), avg=el(side+'Avg');
-  const nxt   = el(side+'Next'), unr=el(side+'Unreal'), ren=el(side+'Reentry');
+  const rows  = el(side+'Rows'), tot=el(side+'Tot'), avg=el(isUp?'upAvg':'dnAvg');
+  const nxt   = el(isUp?'upNext':'dnNext'), unr=el(isUp?'upUnreal':'dnUnreal'), ren=el(isUp?'upReentry':'dnReentry');
   const body  = el(isUp?'upBody':'dnBody');
 
   if (inactive) {
@@ -445,21 +491,25 @@ function renderLadder(side, ladder, price, inactive) {
   if (!ladder||ladder.totalShares===0) {
     rows.innerHTML='<div class="nop">Waiting for entry...</div>';
     tot.textContent='0 sh'; avg.textContent='—';
-    nxt.textContent = price>=0.55&&price<=0.90?'$'+(price-0.05).toFixed(2):'Wait $0.55';
+    if (price!==null&&price!==undefined) {
+      nxt.textContent = price<=0.90?'$'+Math.max(0.05,(price-0.05)).toFixed(2):'Wait <$0.90';
+    } else {
+      nxt.textContent = '—';
+    }
     unr.textContent='$0.00'; unr.style.color='var(--text2)';
-    ren.textContent = ladder?.lastSoldPrice?'$'+((ladder.lastSoldPrice-0.05).toFixed(2)):'$0.55';
+    ren.textContent = ladder?.lastSoldPrice?'$'+((ladder.lastSoldPrice-0.05).toFixed(2)):'$0.90';
     return;
   }
   tot.textContent = ladder.totalShares+' sh · $'+ladder.totalCost.toFixed(2);
   avg.textContent = '$'+ladder.avgEntry.toFixed(4);
-  nxt.textContent = ladder.nextBuy?'$'+ladder.nextBuy.toFixed(4):'—';
+  nxt.textContent = ladder.nextBuy!==null?'$'+ladder.nextBuy.toFixed(4):'—';
   ren.textContent = '$'+ladder.reEntry.toFixed(2);
   const u = ladder.unrealizedPnl||0;
   unr.textContent = (u>=0?'+':'')+'$'+u.toFixed(2);
   unr.style.color = u>=0?'var(--green)':'var(--red)';
   const cls = isUp?'act':'act-dn', epcls = isUp?'lep':'lep-dn';
   rows.innerHTML = (ladder.positions||[]).slice(0,8).map(p=>{
-    const pnl = price?p.shares*price-p.shares*p.price:0;
+    const pnl = price!==null?p.shares*price-p.shares*p.price:0;
     return `<div class="lrow ${cls}"><span class="${epcls}">$${p.price.toFixed(4)}</span><span class="lsh">${p.shares}sh</span><span class="lpnl ${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</span></div>`;
   }).join('')||'<div class="nop">No positions</div>';
 }
@@ -496,8 +546,9 @@ function renderHistory(h) {
   if(!h.length){ w.innerHTML='<div style="text-align:center;padding:18px;color:var(--text3);font-size:10px">No completed windows</div>'; return; }
   w.innerHTML=h.map(x=>{
     const al=x.activeLadders||'both';
+    const srcIcon = x.priceSource==='sim'?' 🎮':x.priceSource==='ws'?' 📡':'';
     return `<div class="hr ${x.pnl>=0?'win':'loss'}">
-      <span class="hslug">${x.slug||'—'}${x.simulated?' 🎮':''}</span>
+      <span class="hslug">${x.slug||'—'}${x.simulated?' 🎮':srcIcon}</span>
       <span class="hadder" style="color:${al==='up'?'var(--green)':al==='down'?'var(--red)':'var(--blue)'}">${al.toUpperCase()}</span>
       <span class="hres" style="color:${x.resolution==='up'?'var(--green)':'var(--red)'}">${(x.resolution||'').toUpperCase()}</span>
       <span class="hpnl ${x.pnl>=0?'pos':'neg'}">${x.pnl>=0?'+':''}$${x.pnl.toFixed(2)}</span>
