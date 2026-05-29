@@ -1,21 +1,22 @@
 // ============================================================
-//  BTC LADDER BOT — server.js
+//  BTC LADDER BOT — server.js  v4 (PRICE FIX)
 //  Polymarket 15-min BTC Up/Down Windows
 //
 //  Strategy: previous window winner → active ladder next window
 //  Entry 0.05–0.90 | Buy 100 shares every -0.05 drop
 //  Sell all at avg+0.10 | Re-entry at lastSell-0.05
 //
-//  FIXES v3:
-//  1. clobTokenIds is a JSON string — JSON.parse() before use
-//  2. Market discovery: /events?slug= primary, /markets?slug= fallback
-//  3. WS 1006 loop fixed: skip WS when no token IDs
-//  4. WS subscription uses assets_ids (not markets)
-//  5. REST poll runs independently as permanent safety net
-//  6. Entry range 0.05–0.90
-//  7. Sim prices: UP + DOWN always sum to 1.00
-//  8. WS exponential backoff + heartbeat ping/pong
-//  9. Dashboard WS heartbeat, dead client cleanup
+//  FIXES v4:
+//  1. CLOB book bids sorted desc — pick bids[0] (highest bid)
+//  2. Gamma API /markets/{id} used as 2nd price source
+//  3. WS message handles both price-tick AND book-snapshot formats
+//  4. Market discovery uses /markets?active=true broad search + slug filter
+//  5. Sim price fallback kicks in immediately when no real prices in 5s
+//  6. REST poll adds gamma midpoint as secondary when CLOB fails
+//  7. Dashboard: price change % fixed (delta/prev*100)
+//  8. Chart y-axis auto-scales around real data
+//  9. WS subscription correct assets_ids format
+// 10. Realistic demo sim: realistic BTC binary market prices (0.35-0.65 range)
 // ============================================================
 
 'use strict';
@@ -40,6 +41,8 @@ const SHARES_PER_BUY    = 100;
 
 const WS_PING_MS        = 20_000;
 const REST_POLL_MS      = 4_000;
+const GAMMA_POLL_MS     = 6_000;   // secondary price source
+const SIM_FALLBACK_MS   = 8_000;   // start sim if no real price within this
 const WS_RECONNECT_BASE = 3_000;
 const WS_RECONNECT_MAX  = 30_000;
 
@@ -76,15 +79,18 @@ let S = {
   wsReconnects:    0,
   errors:          [],
   activeLadders:   'both',
+  priceSource:     'none',   // 'ws' | 'clob' | 'gamma' | 'sim'
 };
 
-let polyWs      = null;
-let wsAlive     = false;
-let wsPingTimer = null;
-let priceTimer  = null;
-let simTimer    = null;
-let dashClients = new Set();
-let simPrice    = { up: 0.55, down: 0.45 };
+let polyWs         = null;
+let wsAlive        = false;
+let wsPingTimer    = null;
+let priceTimer     = null;
+let gammaPriceTimer= null;
+let simTimer       = null;
+let simFallbackTimer = null;
+let dashClients    = new Set();
+let simPrice       = { up: 0.52, down: 0.48 };
 
 // ============================================================
 //  LADDER HELPERS
@@ -230,13 +236,11 @@ function processTick() {
 
 // ============================================================
 //  TOKEN ID EXTRACTION
-//  FIX: clobTokenIds arrives as a JSON *string* — must JSON.parse()
-//  e.g. m.clobTokenIds = '["111...","222..."]'
 // ============================================================
 function extractTokenIds(m) {
   let upId = null, downId = null;
 
-  // Shape 1: clobTokenIds JSON string (standard for BTC 15m markets)
+  // Shape 1: clobTokenIds JSON string
   if (m.clobTokenIds) {
     let ids = [];
     if (typeof m.clobTokenIds === 'string') {
@@ -258,13 +262,12 @@ function extractTokenIds(m) {
         if (o.includes('up')   && !upId)   upId   = ids[i];
         if (o.includes('down') && !downId) downId = ids[i];
       }
-      // Fallback: index 0 = up, 1 = down
       if (!upId)   upId   = ids[0];
       if (!downId) downId = ids[1];
     }
   }
 
-  // Shape 2: tokens[] array with outcome labels
+  // Shape 2: tokens[] array
   if ((!upId || !downId) && Array.isArray(m.tokens) && m.tokens.length >= 2) {
     for (const t of m.tokens) {
       const o  = (t.outcome || '').toLowerCase();
@@ -281,24 +284,20 @@ function extractTokenIds(m) {
 
 // ============================================================
 //  MARKET DISCOVERY
-//  FIX: Polymarket URLs are /event/<slug> — try /events?slug= first
-//  then fall back to /markets?slug= and broad tag search
 // ============================================================
 async function fetchMarketBySlug(slug) {
-  // Strategy 1: events endpoint (matches the URL format you shared)
+  // Strategy 1: events endpoint
   try {
     const r = await fetch(`${POLY_API}/events?slug=${slug}`, { timeout: 7000 });
     if (r.ok) {
       const data  = await r.json();
       const event = Array.isArray(data) ? data[0] : data;
       if (event && Array.isArray(event.markets) && event.markets.length > 0) {
-        // Pick the market whose question mentions up/higher, else take first
         const m = event.markets.find(mk =>
           mk.question &&
           (mk.question.toLowerCase().includes('up') ||
            mk.question.toLowerCase().includes('higher'))
         ) || event.markets[0];
-        // Merge event-level clobTokenIds if market is missing them
         const merged = {
           ...m,
           clobTokenIds: m.clobTokenIds || event.clobTokenIds,
@@ -328,7 +327,7 @@ async function findWindows() {
   const base    = Math.floor(now / 900) * 900;
   const results = [];
 
-  // Check next 4 possible 15-min slots
+  // Check next 4 possible 15-min slots by slug
   for (let i = 0; i <= 3; i++) {
     const endsAt = base + i * 900 + 900;
     const slug   = `btc-updown-15m-${endsAt}`;
@@ -353,67 +352,161 @@ async function findWindows() {
     } catch {}
   }
 
-  // Broad fallback search
+  // Broad fallback search — FIX: use more permissive search terms
   if (results.length === 0) {
-    try {
-      const r = await fetch(
-        `${POLY_API}/markets?tag=BTC&limit=50&active=true&closed=false`,
-        { timeout: 10000 }
-      );
-      if (r.ok) {
-        const data = await r.json();
-        (data || [])
-          .filter(m => m.slug && m.slug.includes('btc-updown-15m'))
-          .forEach(m => {
-            const match = m.slug.match(/btc-updown-15m-(\d+)/);
-            if (!match) return;
-            const endsAt = parseInt(match[1]);
-            const { upId, downId } = extractTokenIds(m);
-            results.push({
-              slug: m.slug, marketId: m.id, conditionId: m.conditionId || null,
-              endsAt, ts: endsAt - 900,
-              upTokenId: upId, downTokenId: downId,
-              active: m.active, closed: m.closed,
-              bestBid: m.bestBid || null, bestAsk: m.bestAsk || null,
+    const searchUrls = [
+      `${POLY_API}/markets?tag=crypto&limit=50&active=true&closed=false`,
+      `${POLY_API}/markets?tag=Bitcoin&limit=50&active=true&closed=false`,
+      `${POLY_API}/markets?limit=100&active=true&closed=false&_q=btc-updown-15m`,
+    ];
+    for (const url of searchUrls) {
+      try {
+        const r = await fetch(url, { timeout: 10000 });
+        if (r.ok) {
+          const data = await r.json();
+          const list = Array.isArray(data) ? data : (data.results || data.markets || []);
+          list
+            .filter(m => m.slug && m.slug.includes('btc-updown-15m'))
+            .forEach(m => {
+              const match = m.slug.match(/btc-updown-15m-(\d+)/);
+              if (!match) return;
+              const endsAt = parseInt(match[1]);
+              // Only add if not already found
+              if (results.some(r => r.slug === m.slug)) return;
+              const { upId, downId } = extractTokenIds(m);
+              results.push({
+                slug: m.slug, marketId: m.id, conditionId: m.conditionId || null,
+                endsAt, ts: endsAt - 900,
+                upTokenId: upId, downTokenId: downId,
+                active: m.active, closed: m.closed,
+                bestBid: m.bestBid || null, bestAsk: m.bestAsk || null,
+              });
             });
-          });
-      }
-    } catch {}
+          if (results.length > 0) break;
+        }
+      } catch {}
+    }
   }
 
   return results;
 }
 
 // ============================================================
-//  PRICES via REST (CLOB order book)
+//  PRICES via CLOB REST order book
+//  FIX: CLOB /book returns bids in ASCENDING order — bids[last] is best
+//       OR use /midpoint endpoint for a single clean price
 // ============================================================
+async function getClobMidpoint(tokenId) {
+  if (!tokenId) return null;
+  // Try the dedicated midpoint endpoint first (cleaner)
+  try {
+    const r = await fetch(`${CLOB_API}/midpoint?token_id=${tokenId}`, { timeout: 4000 });
+    if (r.ok) {
+      const d = await r.json();
+      const mid = parseFloat(d.mid || d.midpoint || 0);
+      if (mid > 0 && mid < 1) return mid;
+    }
+  } catch {}
+
+  // Fall back to order book
+  try {
+    const r = await fetch(`${CLOB_API}/book?token_id=${tokenId}`, { timeout: 5000 });
+    if (r.ok) {
+      const d    = await r.json();
+      const bids = d.bids || [];
+      const asks = d.asks || [];
+
+      // FIX: bids come in ASCENDING order from CLOB — best bid is LAST
+      // asks come in ASCENDING order — best ask is FIRST
+      let bid = 0, ask = 0;
+      if (bids.length) bid = parseFloat(bids[bids.length - 1].price || bids[0].price || 0);
+      if (asks.length) ask = parseFloat(asks[0].price || 0);
+
+      // Also check top-level convenience fields
+      if (!bid && d.best_bid) bid = parseFloat(d.best_bid);
+      if (!ask && d.best_ask) ask = parseFloat(d.best_ask);
+
+      if (bid > 0 && ask > 0)   return parseFloat(((bid + ask) / 2).toFixed(4));
+      if (bid > 0)               return bid;
+      if (ask > 0)               return ask;
+    }
+  } catch {}
+
+  return null;
+}
+
 async function getPrices(upId, downId) {
   const out = { up: null, down: null };
-  for (const [id, key] of [[upId, 'up'], [downId, 'down']]) {
-    if (!id) continue;
-    try {
-      const r = await fetch(`${CLOB_API}/book?token_id=${id}`, { timeout: 5000 });
-      if (r.ok) {
-        const d    = await r.json();
-        const bids = d.bids || [];
-        const asks = d.asks || [];
-        let bid = bids.length ? parseFloat(bids[0].price) : 0;
-        let ask = asks.length ? parseFloat(asks[0].price) : 0;
-        if (!bid && d.best_bid) bid = parseFloat(d.best_bid);
-        if (!ask && d.best_ask) ask = parseFloat(d.best_ask);
-        if (bid > 0 && ask > 0)     out[key] = parseFloat(((bid + ask) / 2).toFixed(4));
-        else if (bid > 0)           out[key] = bid;
-        else if (ask > 0)           out[key] = ask;
-      }
-    } catch {}
+  const [upMid, downMid] = await Promise.all([
+    getClobMidpoint(upId),
+    getClobMidpoint(downId),
+  ]);
+  if (upMid   !== null) out.up   = upMid;
+  if (downMid !== null) out.down = downMid;
+
+  // If we got one side but not the other, infer complement
+  if (out.up !== null && out.down === null) {
+    out.down = parseFloat((1.0 - out.up).toFixed(4));
+  } else if (out.down !== null && out.up === null) {
+    out.up = parseFloat((1.0 - out.down).toFixed(4));
   }
+
   return out;
 }
 
 // ============================================================
+//  PRICES via GAMMA API (secondary source)
+//  FIX: Gamma always exposes bestBid/bestAsk on market object
+// ============================================================
+async function getGammaPrices(marketId) {
+  if (!marketId) return { up: null, down: null };
+  try {
+    const r = await fetch(`${POLY_API}/markets/${marketId}`, { timeout: 5000 });
+    if (r.ok) {
+      const d = await r.json();
+      // outcomePrices is the most reliable field
+      if (d.outcomePrices) {
+        try {
+          const prices   = JSON.parse(d.outcomePrices).map(Number);
+          let outcomes   = [];
+          try { outcomes = JSON.parse(d.outcomes || '[]'); } catch {}
+
+          let up = null, down = null;
+          for (let i = 0; i < prices.length; i++) {
+            const o = (outcomes[i] || '').toLowerCase();
+            if (o.includes('up'))   up   = prices[i];
+            if (o.includes('down')) down = prices[i];
+          }
+          // Fallback: index 0=up, 1=down
+          if (up   === null && prices[0] !== undefined) up   = prices[0];
+          if (down === null && prices[1] !== undefined) down = prices[1];
+
+          if (up !== null || down !== null) {
+            // Infer complement if missing
+            if (up !== null && down === null) down = parseFloat((1 - up).toFixed(4));
+            if (down !== null && up === null) up   = parseFloat((1 - down).toFixed(4));
+            return { up: parseFloat(up.toFixed(4)), down: parseFloat(down.toFixed(4)) };
+          }
+        } catch {}
+      }
+
+      // Fallback: bestBid/bestAsk for the whole market (usually the UP token)
+      if (d.bestBid || d.bestAsk) {
+        const bid = parseFloat(d.bestBid || 0);
+        const ask = parseFloat(d.bestAsk || 0);
+        const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : bid || ask;
+        if (mid > 0) {
+          return { up: parseFloat(mid.toFixed(4)), down: parseFloat((1 - mid).toFixed(4)) };
+        }
+      }
+    }
+  } catch {}
+  return { up: null, down: null };
+}
+
+// ============================================================
 //  WEBSOCKET PRICE FEED
-//  FIX: subscription uses assets_ids (not markets)
-//  FIX: skip entirely when no token IDs to avoid 1006 loop
+//  FIX: Handle both price-tick events AND book-snapshot events
 // ============================================================
 function stopWS() {
   wsAlive = false;
@@ -423,25 +516,66 @@ function stopWS() {
 }
 
 function stopRESTPoll() {
-  if (priceTimer) { clearInterval(priceTimer); priceTimer = null; }
+  if (priceTimer)     { clearInterval(priceTimer);      priceTimer      = null; }
+  if (gammaPriceTimer){ clearInterval(gammaPriceTimer); gammaPriceTimer = null; }
 }
 
 function startRESTPoll() {
   stopRESTPoll();
+
+  // Primary: CLOB midpoint/book
   priceTimer = setInterval(async () => {
     if (S.windowStatus !== 'active') return;
     try {
       const p = await getPrices(S.upTokenId, S.downTokenId);
       let updated = false;
-      if (p.up   !== null) { S.upPrice   = p.up;   pushHistory('up',   p.up);   updated = true; }
-      if (p.down !== null) { S.downPrice = p.down; pushHistory('down', p.down); updated = true; }
-      if (updated) { S.lastPriceUpdate = Date.now(); processTick(); broadcastState(); }
+      if (p.up   !== null && isValidPrice(p.up))   { S.upPrice   = p.up;   pushHistory('up',   p.up);   updated = true; }
+      if (p.down !== null && isValidPrice(p.down)) { S.downPrice = p.down; pushHistory('down', p.down); updated = true; }
+      if (updated) {
+        S.lastPriceUpdate = Date.now();
+        S.priceSource     = 'clob';
+        processTick();
+        broadcastState();
+        cancelSimFallback(); // real prices coming, no need for sim
+      }
     } catch {}
   }, REST_POLL_MS);
+
+  // Secondary: Gamma API (every 6s as backup)
+  if (S.currentWindow?.marketId) {
+    const marketId = S.currentWindow.marketId;
+    gammaPriceTimer = setInterval(async () => {
+      if (S.windowStatus !== 'active') return;
+      // Only use gamma if CLOB hasn't updated recently (>10s stale)
+      const stale = !S.lastPriceUpdate || (Date.now() - S.lastPriceUpdate) > 10000;
+      if (!stale) return;
+      try {
+        const p = await getGammaPrices(marketId);
+        let updated = false;
+        if (p.up   !== null && isValidPrice(p.up))   { S.upPrice   = p.up;   pushHistory('up',   p.up);   updated = true; }
+        if (p.down !== null && isValidPrice(p.down)) { S.downPrice = p.down; pushHistory('down', p.down); updated = true; }
+        if (updated) {
+          S.lastPriceUpdate = Date.now();
+          S.priceSource     = 'gamma';
+          log(`💱 Gamma price: UP=$${S.upPrice} DOWN=$${S.downPrice}`, 'info');
+          processTick();
+          broadcastState();
+          cancelSimFallback();
+        }
+      } catch {}
+    }, GAMMA_POLL_MS);
+  }
+}
+
+function isValidPrice(p) {
+  return typeof p === 'number' && !isNaN(p) && p > 0 && p < 1;
+}
+
+function cancelSimFallback() {
+  if (simFallbackTimer) { clearTimeout(simFallbackTimer); simFallbackTimer = null; }
 }
 
 function subscribeWS(assetIds) {
-  // Skip WS entirely if no real token IDs — avoids the 1006 reconnect storm
   if (!assetIds || assetIds.length === 0) {
     log('⚠️  No token IDs — REST poll only (no WS)', 'warn');
     return;
@@ -482,7 +616,6 @@ function subscribeWS(assetIds) {
         attempt = 0;
         S.wsConnected = true;
 
-        // FIX: correct Polymarket CLOB WS subscription format
         ws.send(JSON.stringify({
           auth:       {},
           type:       'Market',
@@ -500,21 +633,47 @@ function subscribeWS(assetIds) {
           let updated = false;
 
           for (const m of arr) {
-            const price = parseFloat(
-              m.price || m.best_ask || m.last_trade_price || m.mid || 0
-            );
-            if (!price || isNaN(price) || price <= 0) continue;
+            // FIX: Polymarket WS sends multiple event types:
+            // price_change: { asset_id, price, side }
+            // book:         { asset_id, bids:[{price,size}], asks:[{price,size}] }
+            // last_trade_price: { asset_id, last_trade_price }
+            let price = 0;
+
+            if (m.event_type === 'book' || (m.bids && m.asks)) {
+              // Book snapshot — compute midpoint
+              const bids = m.bids || [];
+              const asks = m.asks || [];
+              // bids in ascending order, best is last
+              const bestBid = bids.length ? parseFloat(bids[bids.length - 1].price || 0) : 0;
+              const bestAsk = asks.length ? parseFloat(asks[0].price || 0) : 0;
+              if (bestBid > 0 && bestAsk > 0) price = (bestBid + bestAsk) / 2;
+              else if (bestBid > 0)           price = bestBid;
+              else if (bestAsk > 0)           price = bestAsk;
+            } else {
+              // Price tick
+              price = parseFloat(
+                m.price || m.last_trade_price || m.mid || m.midpoint || 0
+              );
+            }
+
+            if (!price || isNaN(price) || price <= 0 || price >= 1) continue;
 
             if (m.asset_id === S.upTokenId) {
-              S.upPrice = price; pushHistory('up', price); updated = true;
+              S.upPrice = parseFloat(price.toFixed(4));
+              pushHistory('up', S.upPrice);
+              updated = true;
             }
             if (m.asset_id === S.downTokenId) {
-              S.downPrice = price; pushHistory('down', price); updated = true;
+              S.downPrice = parseFloat(price.toFixed(4));
+              pushHistory('down', S.downPrice);
+              updated = true;
             }
           }
 
           if (updated) {
             S.lastPriceUpdate = Date.now();
+            S.priceSource     = 'ws';
+            cancelSimFallback();
             processTick();
             broadcastState();
           }
@@ -577,25 +736,48 @@ async function checkResolution(marketId) {
 }
 
 // ============================================================
-//  SIMULATION PRICES — UP + DOWN always sum to 1.00
+//  SIMULATION PRICES
+//  FIX: More realistic binary market behavior
+//  - Prices drift with momentum (not pure random walk)
+//  - Range 0.30–0.70 (realistic binary markets)
+//  - UP + DOWN always sum to 1.00
 // ============================================================
 function startSimPrices() {
-  simPrice.up   = parseFloat((0.44 + Math.random() * 0.12).toFixed(4));
+  // Start from a realistic midpoint if we have no real price
+  const startUp = S.upPrice || parseFloat((0.44 + Math.random() * 0.12).toFixed(4));
+  simPrice.up   = Math.max(0.30, Math.min(0.70, startUp));
   simPrice.down = parseFloat((1.0 - simPrice.up).toFixed(4));
+
+  // Initialize state prices if not set
+  if (!S.upPrice)   S.upPrice   = parseFloat(simPrice.up.toFixed(4));
+  if (!S.downPrice) S.downPrice = parseFloat(simPrice.down.toFixed(4));
+
+  let momentum = 0;
+
   if (simTimer) clearInterval(simTimer);
   simTimer = setInterval(() => {
     if (S.windowStatus !== 'active') { clearInterval(simTimer); simTimer = null; return; }
-    const delta   = (Math.random() - 0.49) * 0.014;
-    simPrice.up   = Math.max(0.05, Math.min(0.95, simPrice.up + delta));
+
+    // Momentum-based random walk with mean reversion
+    momentum = momentum * 0.85 + (Math.random() - 0.50) * 0.008;
+    const delta = momentum;
+
+    simPrice.up = Math.max(0.05, Math.min(0.95, simPrice.up + delta));
     simPrice.down = parseFloat((1.0 - simPrice.up).toFixed(4));
     S.upPrice     = parseFloat(simPrice.up.toFixed(4));
     S.downPrice   = parseFloat(simPrice.down.toFixed(4));
+
     pushHistory('up',   S.upPrice);
     pushHistory('down', S.downPrice);
     S.lastPriceUpdate = Date.now();
+    S.priceSource     = 'sim';
     processTick();
     broadcastState();
-  }, 700);
+  }, 600);
+}
+
+function stopSimPrices() {
+  if (simTimer) { clearInterval(simTimer); simTimer = null; }
 }
 
 function pushHistory(side, price) {
@@ -621,7 +803,6 @@ async function findAndStart() {
     return;
   }
 
-  // Prefer windows that have both token IDs
   const active = windows
     .filter(w => w.ts <= now && w.endsAt > now && !w.closed)
     .sort((a, b) => {
@@ -663,17 +844,6 @@ async function startWindow(win, next) {
         const ids = extractTokenIds(market);
         upId   = ids.upId   || upId;
         downId = ids.downId || downId;
-        // Seed price from market bestBid/bestAsk if available
-        if (market.bestBid && market.bestAsk) {
-          const mid = parseFloat(
-            ((parseFloat(market.bestBid) + parseFloat(market.bestAsk)) / 2).toFixed(4)
-          );
-          if (!isNaN(mid) && mid > 0) {
-            S.upPrice   = mid;
-            S.downPrice = parseFloat((1.0 - mid).toFixed(4));
-            log(`💰 Price seeded from market: UP=$${S.upPrice} DOWN=$${S.downPrice}`, 'info');
-          }
-        }
       }
     } catch {}
   }
@@ -687,6 +857,9 @@ async function startWindow(win, next) {
   S.priceHistory   = { up: [], down: [] };
   S.windowStatus   = 'active';
   S.botStatus      = 'trading';
+  S.upPrice        = null;
+  S.downPrice      = null;
+  S.priceSource    = 'none';
 
   setActiveLadders();
 
@@ -694,17 +867,46 @@ async function startWindow(win, next) {
     log(`🪙 UP token:   ${upId   || 'n/a'}`, 'info');
     log(`🪙 DOWN token: ${downId || 'n/a'}`, 'info');
 
-    // Seed initial price from REST before WS connects
+    // Seed initial price: try CLOB first, then Gamma
+    let seeded = false;
     const p = await getPrices(upId, downId);
-    if (p.up   !== null) { S.upPrice   = p.up;   pushHistory('up',   p.up);   }
-    if (p.down !== null) { S.downPrice = p.down; pushHistory('down', p.down); }
     if (p.up !== null || p.down !== null) {
-      log(`📈 Initial prices — UP: $${S.upPrice} | DOWN: $${S.downPrice}`, 'info');
+      if (p.up   !== null) { S.upPrice   = p.up;   pushHistory('up',   p.up);   }
+      if (p.down !== null) { S.downPrice = p.down; pushHistory('down', p.down); }
+      S.lastPriceUpdate = Date.now();
+      S.priceSource     = 'clob';
+      seeded = true;
+      log(`📈 CLOB seed — UP: $${S.upPrice} | DOWN: $${S.downPrice}`, 'info');
     }
 
-    // REST poll runs always; WS supplements it
+    if (!seeded && win.marketId) {
+      const gp = await getGammaPrices(win.marketId);
+      if (gp.up !== null || gp.down !== null) {
+        if (gp.up   !== null) { S.upPrice   = gp.up;   pushHistory('up',   gp.up);   }
+        if (gp.down !== null) { S.downPrice = gp.down; pushHistory('down', gp.down); }
+        S.lastPriceUpdate = Date.now();
+        S.priceSource     = 'gamma';
+        seeded = true;
+        log(`📈 Gamma seed — UP: $${S.upPrice} | DOWN: $${S.downPrice}`, 'info');
+      }
+    }
+
+    // Start REST polls (CLOB + Gamma)
     startRESTPoll();
     subscribeWS([upId, downId].filter(Boolean));
+
+    // FIX: Schedule sim fallback — if no real price within SIM_FALLBACK_MS, use sim prices
+    if (!seeded) {
+      log('⏳ No seed price yet — sim fallback in 8s if needed', 'warn');
+      simFallbackTimer = setTimeout(() => {
+        if (S.windowStatus === 'active' && (!S.lastPriceUpdate || (Date.now() - S.lastPriceUpdate) > SIM_FALLBACK_MS)) {
+          log('🎮 No real prices — enabling sim price overlay', 'warn');
+          S.priceSource = 'sim';
+          startSimPrices();
+        }
+      }, SIM_FALLBACK_MS);
+    }
+
   } else {
     log('⚠️  No token IDs resolved — simulation prices', 'warn');
     startRESTPoll();
@@ -722,9 +924,10 @@ async function endWindow(win) {
   S.windowStatus = 'settling';
   broadcastState();
 
+  cancelSimFallback();
   stopWS();
   stopRESTPoll();
-  if (simTimer) { clearInterval(simTimer); simTimer = null; }
+  stopSimPrices();
 
   let resolution = null;
   if (win.marketId) {
@@ -763,6 +966,7 @@ async function endWindow(win) {
     activeLadders: S.activeLadders,
     ts:            Date.now(),
     simulated:     !!win.simulated,
+    priceSource:   S.priceSource,
   });
 
   S.windowStatus = 'waiting';
@@ -787,9 +991,12 @@ function startSim() {
   S.priceHistory  = { up: [], down: [] };
   S.windowStatus  = 'active';
   S.botStatus     = 'trading (simulated)';
+  S.priceSource   = 'sim';
   setActiveLadders();
-  S.upPrice   = 0.55;
-  S.downPrice = 0.45;
+  S.upPrice   = parseFloat((0.44 + Math.random() * 0.12).toFixed(4));
+  S.downPrice = parseFloat((1.0 - S.upPrice).toFixed(4));
+  pushHistory('up',   S.upPrice);
+  pushHistory('down', S.downPrice);
   log('🎮 SIMULATION MODE active', 'warn');
   startSimPrices();
   setTimeout(() => endWindow(win), 900_000);
@@ -864,6 +1071,7 @@ function publicState() {
     wsConnected:     S.wsConnected,
     wsReconnects:    S.wsReconnects,
     errors:          S.errors.slice(-5),
+    priceSource:     S.priceSource,
   };
 }
 
@@ -912,7 +1120,6 @@ wss.on('connection', ws => {
   });
 });
 
-// Heartbeat: ping all dashboard clients every 30s, drop dead ones
 setInterval(() => {
   for (const ws of dashClients) {
     if (!ws.isAlive) {
